@@ -1,8 +1,8 @@
 {
   "xlarge": {
-    "input": "/home/karina/1cbh_clear/00_reference_structures/seed/2xseed_AB_1xcellulose_dp20_merged.pdb",
-    "contig": "27-40,B5-5,18-24,B26-26,1-3,B28-32,1-3,B34-35,27-40",
-    "length": "83-119",
+    "input": "/home/karina/1cbh_clear/00_reference_structures/seed/2xseed_AB_1xcellulose_dp20.pdb",
+    "contig": "17-30,B5-5,18-24,B26-26,1-3,B28-32,1-3,B34-35,17-30",
+    "length": "63-99",
     "select_fixed_atoms": {
       "B5": "ALL",
       "B26": "BKBN",

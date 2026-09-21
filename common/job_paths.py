@@ -372,3 +372,167 @@ def stage03_inputs_dir(stage: Path, experiment: str) -> Path:
 def stage03_archive_path(stage: Path, experiment: str, group_key: str) -> Path:
     return stage03_inputs_dir(stage, experiment) / f"{group_key}.tar.gz"
 
+
+def fixed_residues_path(stage: Path, experiment: str) -> Path:
+    """Where stage 01 records which residues it held fixed, one JSONL line per
+    structure. Run state, not a result: it lives under job_runs/ and is not
+    committed."""
+    return stage / "job_runs" / f"fixed_residues_{experiment}.jsonl"
+
+
+# Step 8. Stage 03: ProteinMPNN.
+
+STAGE04_DIRNAME = "04_alphafold"
+
+
+def stage04_root(stage: Path) -> Path:
+    return project_root(stage) / STAGE04_DIRNAME
+
+
+def stage04_archive_path(stage: Path, experiment: str, group_key: str) -> Path:
+    return stage04_root(stage) / INPUTS_DIRNAME / experiment / f"{group_key}.tar.gz"
+
+
+def prepared_dir(stage: Path, experiment: str, group_key: str) -> Path:
+    """The backbones handed to ProteinMPNN for one group, ligand stripped.
+
+    Kept per group rather than in one flat folder so provenance is structural:
+    the old flat layout lost which experiment a structure came from and had to
+    recover it afterwards from a committed map file.
+    """
+    return stage / "inputs_prepared" / experiment / group_key
+
+
+def mpnn_work_dir(stage: Path, experiment: str, group_key: str) -> Path:
+    """Scratch for one group's MPNN run: the jsonls it needs and the raw fastas
+    it produces, before they are archived."""
+    return stage / "job_runs" / "mpnn" / experiment / group_key
+
+
+def fixed_positions_path(stage: Path, experiment: str, group_key: str) -> Path:
+    return mpnn_work_dir(stage, experiment, group_key) / "fixed_positions.jsonl"
+
+
+def bias_aa_path(stage: Path) -> Path:
+    """Hand-chosen composition bias -- config, so it lives with the code and is
+    committed, unlike everything else here."""
+    return stage / "scripts" / "jsonls" / "bias_AA.jsonl"
+
+
+def mpnn_outputs_path(stage: Path, experiment: str, group_key: str) -> Path:
+    """Every sequence MPNN designed for a group, before the best are chosen."""
+    return stage / "outputs" / experiment / f"{group_key}.tar.gz"
+
+
+# Step 9. Stage 04: AlphaFold3.
+
+def af3_job_name(sequence_id: str) -> str:
+    """The AF3 job name for a sequence.
+
+    Still carries the '_monomer' suffix although the dimer job is gone: the
+    16k production run's outputs are named this way, and dropping the suffix
+    would make every one of them look unfolded and re-queue days of GPU time.
+    """
+    return f"{sequence_id}_monomer"
+
+
+def af3_json_experiment_dir(stage: Path, experiment: str) -> Path:
+    return stage / "job_runs" / "af3" / experiment
+
+
+def af3_json_dir(stage: Path, experiment: str, group_key: str) -> Path:
+    """Where a group's AF3 input jsons are written. Run state, not results."""
+    return af3_json_experiment_dir(stage, experiment) / group_key
+
+
+def af3_json_path(stage: Path, experiment: str, group_key: str, sequence_id: str) -> Path:
+    return af3_json_dir(stage, experiment, group_key) / f"{af3_job_name(sequence_id)}.json"
+
+
+def af3_output_dir(stage: Path, job_name: str) -> Path:
+    """AF3's consolidated output for one job, flat by job name.
+
+    Flat because sequence_id is globally unique, and because this is where the
+    existing production outputs already live.
+    """
+    return stage / "outputs" / job_name
+
+
+def af3_model_cif(stage: Path, job_name: str, sample_dir_name: str) -> Path:
+    return af3_output_dir(stage, job_name) / sample_dir_name / f"{job_name}_{sample_dir_name}_model.cif"
+
+
+def af3_ranking_path(stage: Path, job_name: str) -> Path:
+    return af3_output_dir(stage, job_name) / f"{job_name}_ranking_scores.csv"
+
+
+def af3_run_dir(stage: Path, job_name: str) -> Path:
+    """AF3's per-job scratch (af_input/af_output), before consolidation."""
+    return stage / "af3_runs" / job_name
+
+
+# Step 10. Stage 05: LigandMPNN interface redesign.
+
+STAGE05_DIRNAME = "05_ligandmpnn"
+
+
+def stage05_root(stage: Path) -> Path:
+    return project_root(stage) / STAGE05_DIRNAME
+
+
+def stage05_archive_path(stage: Path, experiment: str, group_key: str) -> Path:
+    return stage05_root(stage) / INPUTS_DIRNAME / experiment / f"{group_key}.tar.gz"
+
+
+def complex_dir(stage: Path, experiment: str, group_key: str) -> Path:
+    """The protein+ligand complexes handed to LigandMPNN, one pdb per sequence.
+
+    Built here rather than carried from stage 04: the AF3 prediction has no
+    ligand, and the ligand's placement only exists once the prediction has been
+    superposed onto the reference it was designed against.
+    """
+    return stage / "inputs_prepared" / experiment / group_key
+
+
+def complex_path(stage: Path, experiment: str, group_key: str, sequence_id: str) -> Path:
+    return complex_dir(stage, experiment, group_key) / f"{sequence_id}.pdb"
+
+
+def rejected_complex_dir(stage: Path, experiment: str, group_key: str) -> Path:
+    """Complexes the clash check turned away, kept for inspection."""
+    return stage / "inputs_rejected" / experiment / group_key
+
+
+def clash_table_path(stage: Path, experiment: str) -> Path:
+    return stage / TABLES_DIRNAME / f"stage_{stage_label(stage)}_clashes_{experiment}.csv"
+
+
+def ligand_work_dir(stage: Path, experiment: str, group_key: str) -> Path:
+    return stage / "job_runs" / "ligandmpnn" / experiment / group_key
+
+
+def redesign_spec_path(stage: Path, experiment: str, group_key: str) -> Path:
+    """Which residues LigandMPNN may change, and which are tied to which.
+
+    One file per group holding a record per sequence, because the 8 A shell is
+    a property of the individual complex, not of the group.
+    """
+    return ligand_work_dir(stage, experiment, group_key) / "redesign.jsonl"
+
+
+def ligand_outputs_path(stage: Path, experiment: str, group_key: str) -> Path:
+    return stage / "outputs" / experiment / f"{group_key}.tar.gz"
+
+
+# Step 11. Stage 06: RFD3 linker generation.
+
+STAGE06_DIRNAME = "06_rfd3_linker"
+
+
+def stage06_root(stage: Path) -> Path:
+    return project_root(stage) / STAGE06_DIRNAME
+
+
+def stage06_archive_path(stage: Path, experiment: str, group_key: str) -> Path:
+    return stage06_root(stage) / INPUTS_DIRNAME / experiment / f"{group_key}.tar.gz"
+

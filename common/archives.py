@@ -1,6 +1,17 @@
 """
 Tar-archive and results-table handling shared by every stage.
 
+Each stage does the same two things with its outputs: fold loose per-structure
+files into one <group>.tar.gz, and keep a per-experiment results table that
+records what has already been processed so a re-run is cheap. The mechanics are
+identical stage to stage; only the columns and the pass/fail rule differ, and
+those stay in the stage's own module.
+
+Everything that rewrites an archive does it the same way: read what is already
+there, write the combination to a temp file, verify every expected member is
+present, then os.replace. A crash at any point leaves the previous archive
+intact rather than a truncated one, and loose originals are deleted only after
+the swap succeeds.
 """
 from __future__ import annotations
 
@@ -44,6 +55,12 @@ class SortResult:
 
 def group_members_by_protein(member_names: Sequence[str]) -> Dict[str, Dict[str, str]]:
     """Group tar members by protein_id -> {'json': name, 'structure': name}.
+
+    Any member whose suffix is not .json/.cif/.pdb is ignored, which is what
+    keeps the directory entry ('./') that `tar czf ... -C dir .` writes from
+    becoming a bogus empty protein_id. Either half may be missing for a real
+    protein_id; deciding what that means belongs to the caller, so this never
+    raises.
     """
     groups: Dict[str, Dict[str, str]] = {}
     for member_name in member_names:
@@ -93,7 +110,12 @@ def _write_and_swap(
             add(out)
 
         with tarfile.open(temp_path, "r:gz") as check:
-            present = {Path(name).name for name in check.getnames()}
+            # Full member names, not basenames: stage 03 nests its fastas as
+            # <protein_id>/<sequence_id>.fa, and comparing basenames there
+            # would report every member missing. A leading "./" is normalised
+            # away because that is how `tar czf ... -C dir .` writes them.
+            present = {name[2:] if name.startswith("./") else name
+                       for name in check.getnames()}
         missing = expected_names - present
         if missing:
             raise ArchiveError(
@@ -107,6 +129,9 @@ def _write_and_swap(
 
 def merge_files_into_archive(archive_path: Path, files: Sequence[Path]) -> Tuple[int, int]:
     """Add loose files on disk to an archive, keeping what is already in it.
+
+    Returns (added, total) counted in members. The loose originals are deleted
+    only once the swap has succeeded.
     """
     existing = read_archive_members(archive_path) if archive_path.exists() else []
     existing_names = {info.name for info, _ in existing}
@@ -155,6 +180,10 @@ def merge_members_into_archive(
 
 def regroup_and_archive(stage: Path, experiment: str) -> List[SortResult]:
     """Fold a run's loose routed files into per-group tarballs.
+
+    Reads sorted_raw/<experiment>/<outcome>/ and writes
+    sorted_clean/<experiment>/<outcome>/<group>.tar.gz, one group at a time so
+    an unparseable name in one group does not stop the others from archiving.
     """
     results: List[SortResult] = []
     for outcome in jp.OUTCOMES:
@@ -191,9 +220,21 @@ def regroup_and_archive(stage: Path, experiment: str) -> List[SortResult]:
 
 
 def load_table(
-    table_path: Path, legacy_path: Optional[Path] = None, experiment: Optional[str] = None
+    table_path: Path, legacy_path: Optional[Path] = None, experiment: Optional[str] = None,
+    key: str = "protein_id",
 ) -> Dict[str, Dict[str, str]]:
-    """Existing rows keyed by protein_id -- the set of structures to skip.
+    """Existing rows keyed by `key` -- the set of things already done.
+
+    The key is a parameter because stages count different things: stages 01 and
+    02 record one row per structure, stage 03 one row per designed sequence. A
+    table keyed on the wrong column silently re-does all its work and leaves
+    stale rows behind, which is exactly what happened before this was a
+    parameter.
+
+    If the per-experiment table does not exist yet but a legacy shared table
+    does, that file's rows for this experiment are read instead, so structures
+    processed before results were split per experiment are still recognised.
+    The legacy file is only ever read.
     """
     source = table_path
     if not table_path.exists() and legacy_path is not None and legacy_path.exists():
@@ -207,7 +248,11 @@ def load_table(
         for row in csv.DictReader(handle):
             if source is legacy_path and experiment and row.get("experiment_name") != experiment:
                 continue
-            by_id[row["protein_id"]] = row
+            if key not in row:
+                raise ArchiveError(
+                    f"{source}: no {key!r} column; found {sorted(row)}"
+                )
+            by_id[row[key]] = row
     return by_id
 
 

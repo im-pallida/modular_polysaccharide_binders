@@ -43,6 +43,11 @@ from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 # helping_scripts/ -> scripts/ -> <stage>/ -> <repo root>/common
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "common"))
 import job_paths as jp  # noqa: E402
+from designs import (  # noqa: E402
+    DesignError,
+    fixed_residue_map,
+    record_line,
+)
 
 STAGE = Path(__file__).resolve().parents[2]  # scripts/helping_scripts/../.. -> STAGE
 
@@ -554,6 +559,49 @@ def archive_experiment(
     return results
 
 
+def _record_fixed_residues(
+    stage: Path, experiment: str, json_path: Path, group_key: str, name: str,
+    produced_json: Optional[Path],
+) -> None:
+    """Append what was held fixed for this structure, in both numberings.
+
+    Written here because this is the only point where both halves exist at
+    once: the design config says which residues had their side chains fixed
+    (in the seed's numbering), and RFD3's own metadata says where each of them
+    ended up in this structure. Later stages need the pairing -- stage 02 to
+    fit the design back onto its seed, stage 03 to tell ProteinMPNN what not to
+    touch -- and deriving it again downstream would mean re-reading a json that
+    may have been edited since.
+
+    Appended under the same lock the sequence counter uses, so parallel cluster
+    jobs cannot interleave a line. Never fatal: a design that fixes no side
+    chains is still a valid thing to generate, it just cannot go past stage 02.
+    """
+    if produced_json is None:
+        _log("[fixed] no metadata json, nothing recorded")
+        return
+    try:
+        data = json.loads(json_path.read_text(encoding="utf-8"))
+        entries = jp.design_entries(data)
+        config = entries.get("") or next(iter(entries.values()))
+        payload = json.loads(produced_json.read_text(encoding="utf-8"))
+        diffused_index_map = payload.get("diffused_index_map") or {}
+        mapped, unmapped = fixed_residue_map(config, diffused_index_map)
+    except (OSError, ValueError, json.JSONDecodeError, DesignError) as exc:
+        _log(f"[fixed] not recorded: {str(exc).splitlines()[0]}")
+        _log("[fixed] this structure cannot be aligned or redesigned past stage 02")
+        return
+
+    record_path = jp.fixed_residues_path(stage, experiment)
+    record_path.parent.mkdir(parents=True, exist_ok=True)
+    with exclusive_lock(Path(f"{record_path}.lock")):
+        with record_path.open("a", encoding="utf-8") as handle:
+            handle.write(record_line(name, group_key, mapped))
+    _log(f"[fixed] {len(mapped)} residue(s) recorded: {mapped}")
+    if unmapped:
+        _log(f"[fixed] {len(unmapped)} not in diffused_index_map: {unmapped}")
+
+
 # Step 4. Run one job.
 
 
@@ -601,6 +649,10 @@ def run_one_job(
         _log()
         _log("===== PLACE FLAT RAW FILES =====")
         _place_raw_files(produced_cifgz, produced_json, raw_dir, raw_cif, raw_json)
+
+        _log()
+        _log("===== RECORD FIXED RESIDUES =====")
+        _record_fixed_residues(stage, experiment, json_path, group_key, name, produced_json)
     except JobError as exc:
         return JobResult(JobStatus.FAILED, name, message=str(exc))
     except Exception:  # noqa: BLE001 - one bad job must not take down a batch
@@ -642,3 +694,4 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

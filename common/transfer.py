@@ -1,5 +1,28 @@
 """
 Hand a stage's passed structures to the next stage.
+
+Every stage does this identically:
+
+    sorted_clean/<experiment>/passed/<group>.tar.gz     <- this stage wrote
+    <next stage>/inputs/<experiment>/<group>.tar.gz     <- this writes
+
+Same <group>.tar.gz filename, just relocated. rejected/ is never read: only
+passed structures move on.
+
+Incremental, with no transfer log. A protein counts as transferred when it is
+already a member of the destination archive, so the destination is the single
+record of what has moved and cannot drift from a separate file. That works
+because regroup_and_archive is cumulative -- a group's passed archive holds
+every structure that ever passed, not just the latest run's -- so source and
+destination can be compared directly.
+
+Destination archives are extended, never overwritten: the next stage needs
+every passed protein ever produced.
+
+A protein moves only with BOTH its metadata json and its structure file. An
+incomplete pair is reported and left behind rather than half-copied.
+
+A stage supplies only where its output goes; everything else is here.
 """
 from __future__ import annotations
 
@@ -22,6 +45,23 @@ PASSED = "passed"
 
 # (stage root, experiment, group_key) -> the archive this group belongs in
 DestinationFor = Callable[[Path, str, str], Path]
+
+# member names -> {protein_id: [member names belonging to it]}. Stages differ in
+# what one protein's files look like -- a json plus a structure for stages 01
+# and 02, a folder of fastas for stage 03 -- so the rule is supplied rather than
+# assumed, and everything else about the transfer stays shared.
+MembersOf = Callable[[Sequence[str]], Dict[str, List[str]]]
+
+
+def paired_members(member_names: Sequence[str]) -> Dict[str, List[str]]:
+    """The default: a protein moves only with BOTH its json and its structure."""
+    grouped: Dict[str, List[str]] = {}
+    for protein_id, entry in group_members_by_protein(member_names).items():
+        if "json" in entry and "structure" in entry:
+            grouped[protein_id] = [entry["json"], entry["structure"]]
+        else:
+            grouped[protein_id] = []      # incomplete: reported, not moved
+    return grouped
 
 
 class TransferError(Exception):
@@ -63,7 +103,12 @@ class TransferReport:
 
 
 def passed_archives(stage: Path, experiment: Optional[str] = None) -> Dict[str, List[Path]]:
-    """{experiment: [passed/<group>.tar.gz, ...]}."""
+    """{experiment: [passed/<group>.tar.gz, ...]}.
+
+    Defaults to every filtered experiment, matching the filters' own
+    sweep-everything behaviour, so a batch an interrupted run left behind is
+    picked up by the next launch whichever experiment that launch was for.
+    """
     names = [experiment] if experiment else jp.sorted_experiments(stage)
     found: Dict[str, List[Path]] = {}
     for name in names:
@@ -76,42 +121,42 @@ def passed_archives(stage: Path, experiment: Optional[str] = None) -> Dict[str, 
     return found
 
 
-def transferred_ids(destination: Path) -> Set[str]:
+def transferred_ids(destination: Path, members_of: MembersOf = paired_members) -> Set[str]:
     """The protein_ids already in a destination archive -- the record of what
     has moved. Reuses the shared grouping so the rule for what makes a
     protein's file pair is defined in exactly one place."""
     if not destination.is_file():
         return set()
     with tarfile.open(destination, "r:gz") as archive:
-        return set(group_members_by_protein(archive.getnames()))
+        return set(members_of(archive.getnames()))
 
 
 def _read_new_members(
-    source_path: Path, already: Set[str]
+    source_path: Path, already: Set[str], members_of: MembersOf
 ) -> Tuple[List[Tuple[tarfile.TarInfo, bytes]], List[str], int]:
-    """Members for proteins not yet in the destination, plus the ids whose
-    file pair is incomplete and the count of those already transferred."""
+    """Members for proteins not yet at the destination, the ids whose file set
+    is incomplete, and how many were already transferred."""
     members: List[Tuple[tarfile.TarInfo, bytes]] = []
     incomplete: List[str] = []
 
     with tarfile.open(source_path, "r:gz") as source:
-        groups = group_members_by_protein(source.getnames())
-        candidates = sorted(pid for pid in groups if pid not in already)
-        skipped = len(groups) - len(candidates)
+        grouped = members_of(source.getnames())
+        candidates = sorted(pid for pid in grouped if pid not in already)
+        skipped = len(grouped) - len(candidates)
 
         for protein_id in candidates:
-            entry = groups[protein_id]
-            if "json" not in entry or "structure" not in entry:
+            names = grouped[protein_id]
+            if not names:
                 incomplete.append(protein_id)
-                _log(f"  [incomplete] {protein_id}: has only {sorted(entry)} "
-                     f"in {source_path.name}; not transferred")
+                _log(f"  [incomplete] {protein_id}: file set incomplete in "
+                     f"{source_path.name}; not transferred")
                 continue
-            for kind in ("json", "structure"):
-                member_info = source.getmember(entry[kind])
+            for member_name in names:
+                member_info = source.getmember(member_name)
                 extracted = source.extractfile(member_info)
                 if extracted is None:
                     raise TransferError(
-                        f"could not read member {entry[kind]!r} from {source_path}"
+                        f"could not read member {member_name!r} from {source_path}"
                     )
                 members.append((member_info, extracted.read()))
 
@@ -120,12 +165,17 @@ def _read_new_members(
 
 def run_transfer(
     stage: Path, destination_for: DestinationFor, label: str,
-    experiment: Optional[str] = None,
+    experiment: Optional[str] = None, members_of: MembersOf = paired_members,
 ) -> TransferReport:
     """Move every passed structure not already at the destination."""
     report = TransferReport()
     by_experiment = passed_archives(stage, experiment)
     if not by_experiment:
+        # Distinguish "the filter has not run" from "it ran and nothing passed".
+        # regroup_and_archive only creates an outcome directory when something
+        # lands in it, so a zero-yield experiment has rejected/ but no passed/,
+        # and reporting that as "nothing under sorted_clean" sends people
+        # looking for a bug that is not there.
         filtered = jp.sorted_experiments(stage)
         if filtered:
             _log(f"[transfer] no passed/ archive in any of {len(filtered)} filtered "
@@ -142,15 +192,19 @@ def run_transfer(
             if not report.results:
                 _log(f"[transfer] {label} inputs -> {destination.parent.parent}")
 
-            already = transferred_ids(destination)
-            members, incomplete, skipped = _read_new_members(source_path, already)
+            already = transferred_ids(destination, members_of)
+            members, incomplete, skipped = _read_new_members(
+                source_path, already, members_of)
             report.already_present += skipped
             report.incomplete.extend(incomplete)
             if not members:
                 continue
 
             added, total = merge_members_into_archive(destination, members)
-            structures = len(members) // 2
+            structures = len(set(
+                member_info.name.split("/")[0] if "/" in member_info.name
+                else Path(member_info.name).stem
+                for member_info, _ in members))
             report.transferred += structures
             report.results.append(
                 TransferResult(experiment_name, group_key, source_path,
@@ -163,7 +217,8 @@ def run_transfer(
 
 
 def cli(destination_for: DestinationFor, label: str, default_stage: Path,
-        doc: str, argv: Optional[List[str]] = None) -> int:
+        doc: str, argv: Optional[List[str]] = None,
+        members_of: MembersOf = paired_members) -> int:
     """The whole command-line side, so a stage's own file is just its
     destination plus a shebang."""
     parser = argparse.ArgumentParser(
@@ -175,7 +230,8 @@ def cli(destination_for: DestinationFor, label: str, default_stage: Path,
                         help="only transfer this one experiment (default: all of them)")
     args = parser.parse_args(argv)
     try:
-        report = run_transfer(args.stage.resolve(), destination_for, label, args.experiment)
+        report = run_transfer(args.stage.resolve(), destination_for, label,
+                              args.experiment, members_of)
     except (OSError, ArchiveError, TransferError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2

@@ -37,6 +37,7 @@ sys.path.insert(0, str(HELPING_SCRIPTS_DIR))
 import job_paths as jp  # noqa: E402
 import run_cluster  # noqa: E402
 import run_workstation  # noqa: E402
+from designs import fixed_residues  # noqa: E402
 from filter_designs import Stage01InputError, run_filter  # noqa: E402
 from run_one_job import archive_experiment, exclusive_lock  # noqa: E402
 from symmetry_check import (  # noqa: E402
@@ -156,6 +157,31 @@ def validate_jsons(experiment_dir: Path, json_names: Sequence[str], stage: Path)
              f"({', '.join(relative_seeds)}). RFD3 resolves it against its own working "
              f"directory on the compute node, which is not this one -- prefer absolute paths.")
     return seed_structures
+
+
+def warn_designs_without_fixed_side_chains(experiment_dir: Path, json_names: Sequence[str]) -> None:
+    """Say at launch which designs cannot go past stage 02.
+
+    Stage 02 aligns on the residues whose side chains were fixed
+    (select_fixed_atoms valued "ALL") and stage 03 holds those same residues
+    fixed. A design that names none can still be generated -- it just stops at
+    stage 02 -- and finding that out now costs nothing, whereas finding it out
+    after a few hundred structures costs the GPU time.
+    """
+    unusable = []
+    for name in json_names:
+        try:
+            data = json.loads((experiment_dir / name).read_text(encoding="utf-8"))
+            for design, config in jp.design_entries(data).items():
+                if not fixed_residues(config):
+                    unusable.append(f"{name}[{design}]" if design else name)
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue  # validate_jsons already reported anything unreadable
+    if unusable:
+        _log(f"[note] {len(unusable)} design(s) fix no side chains "
+             f"(no select_fixed_atoms entry valued \"ALL\"): {', '.join(unusable)}")
+        _log("       these will generate, but stage 02 cannot align them and stage 03 "
+             "cannot hold anything fixed, so they stop after generation.")
 
 
 def check_seed(seed_structure: Path) -> None:
@@ -423,6 +449,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     json_names = discover_jsons(experiment_dir)
     seed_structures = validate_jsons(experiment_dir, json_names, stage)
     check_seeds(seed_structures)
+    warn_designs_without_fixed_side_chains(experiment_dir, json_names)
 
     counts = resolve_counts(json_names, args.count, args.counts)
     run_list, total = build_run_list(stage, args.experiment, counts)
@@ -445,3 +472,4 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

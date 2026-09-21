@@ -36,6 +36,16 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 # helping_scripts/ -> scripts/ -> <stage>/ -> <repo root>/common
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "common"))
 import job_paths as jp  # noqa: E402
+from archives import (  # noqa: E402
+    ArchiveError,
+    SortResult,
+    extract_member,
+    group_members_by_protein,
+    load_table,
+    read_archive_members,
+    regroup_and_archive,
+    save_table,
+)
 
 STAGE = Path(__file__).resolve().parents[2]
 
@@ -67,18 +77,6 @@ class Stage01InputError(Exception):
 
 def _log(*parts: object) -> None:
     print(*parts, flush=True)
-
-
-@dataclass
-class SortResult:
-    """One <group>.tar.gz that this run added members to."""
-    experiment: str
-    outcome: str
-    group_key: str
-    archive: Path
-    added: int = 0
-    total: int = 0
-
 
 @dataclass
 class FilterReport:
@@ -118,152 +116,22 @@ def archives_to_scan(stage: Path, experiment: Optional[str] = None) -> Dict[str,
             found[name] = tars
     return found
 
-
-def group_members_by_protein(member_names: Sequence[str]) -> Dict[str, Dict[str, str]]:
-    """Group tar members by protein_id -> {'json': name, 'structure': name}."""
-    groups: Dict[str, Dict[str, str]] = {}
-    for member_name in member_names:
-        suffix = Path(member_name).suffix.lower()
-        if suffix not in (".json", ".cif", ".pdb"):
-            continue
-        entry = groups.setdefault(Path(member_name).stem, {})
-        entry["json" if suffix == ".json" else "structure"] = member_name
-    return groups
-
-
-def extract_member(archive: tarfile.TarFile, member_name: str, extract_dir: Path) -> Path:
-    extract_dir.mkdir(parents=True, exist_ok=True)
-    archive.extract(member_name, path=extract_dir, **_EXTRACT_KWARGS)
-    return extract_dir / member_name
-
-
 def route_files(json_path: Path, structure_path: Path, target_dir: Path) -> None:
     """Move an evaluated pair into sorted_raw/<experiment>/<outcome>/."""
     target_dir.mkdir(parents=True, exist_ok=True)
     json_path.rename(target_dir / json_path.name)
     structure_path.rename(target_dir / structure_path.name)
 
-
-def read_archive_members(archive_path: Path) -> List[Tuple[tarfile.TarInfo, bytes]]:
-    members: List[Tuple[tarfile.TarInfo, bytes]] = []
-    with tarfile.open(archive_path, "r:gz") as archive:
-        for member_info in archive.getmembers():
-            if not member_info.isfile():
-                continue
-            extracted = archive.extractfile(member_info)
-            if extracted is None:
-                raise Stage01InputError(
-                    f"could not read member {member_info.name!r} from {archive_path}"
-                )
-            members.append((member_info, extracted.read()))
-    return members
-
-
-def _merge_into_archive(archive_path: Path, files: Sequence[Path]) -> Tuple[int, int]:
-    """Add 'files' to 'archive_path', keeping everything already in it."""
-    archive_path.parent.mkdir(parents=True, exist_ok=True)
-
-    existing = read_archive_members(archive_path) if archive_path.exists() else []
-    existing_names = {info.name for info, _ in existing}
-    new_names = {path.name for path in files}
-
-    collision = existing_names & new_names
-    if collision:
-        raise Stage01InputError(
-            f"{archive_path}: already contains {sorted(collision)} but they were about "
-            f"to be added again -- a protein_id was routed twice"
-        )
-
-    temp_path = archive_path.with_name(f".{archive_path.name}.tmp{os.getpid()}")
-    try:
-        with tarfile.open(temp_path, "w:gz") as archive:
-            for member_info, payload in existing:
-                archive.addfile(member_info, io.BytesIO(payload))
-            for path in files:
-                archive.add(path, arcname=path.name)
-
-        with tarfile.open(temp_path, "r:gz") as archive:
-            archived_names = {Path(name).name for name in archive.getnames()}
-
-        missing = (existing_names | new_names) - archived_names
-        if missing:
-            raise Stage01InputError(
-                f"{archive_path}: verification failed, missing {sorted(missing)}"
-            )
-        os.replace(temp_path, archive_path)
-    finally:
-        # No-op after a successful replace; cleans up after any failure above.
-        temp_path.unlink(missing_ok=True)
-
-    for path in files:
-        path.unlink()
-    return len(new_names), len(existing_names | new_names)
-
-
-def regroup_and_archive(stage: Path, experiment: str) -> List[SortResult]:
-    """Fold this run's loose routed files into per-group tarballs."""
-    results: List[SortResult] = []
-    for outcome in jp.OUTCOMES:
-        raw_dir = jp.sorted_raw_dir(stage, experiment, outcome)
-        if not raw_dir.is_dir():
-            continue
-        loose_files = sorted(path for path in raw_dir.iterdir() if path.is_file())
-        if not loose_files:
-            continue
-
-        files_by_group: Dict[str, List[Path]] = {}
-        for file_path in loose_files:
-            group_key = jp.group_key_from_job_name(file_path.stem)
-            files_by_group.setdefault(group_key, []).append(file_path)
-
-        for group_key, group_files in sorted(files_by_group.items()):
-            archive_path = jp.sorted_archive_path(stage, experiment, outcome, group_key)
-            added, total = _merge_into_archive(archive_path, group_files)
-            results.append(
-                SortResult(experiment, outcome, group_key, archive_path, added, total)
-            )
-    return results
-
-
-def load_table(
-    table_path: Path, legacy_path: Optional[Path] = None, experiment: Optional[str] = None
-) -> Dict[str, Dict[str, str]]:
-    """Existing rows keyed by protein_id -- the set of structures to skip."""
-    source = table_path
-    if not table_path.exists() and legacy_path is not None and legacy_path.exists():
-        source = legacy_path
-
-    by_id: Dict[str, Dict[str, str]] = {}
-    if not (source.exists() and source.stat().st_size > 0):
-        return by_id
-
-    with source.open(newline="", encoding="utf-8") as handle:
-        for row in csv.DictReader(handle):
-            if source is legacy_path and experiment and row.get("experiment_name") != experiment:
-                continue
-            by_id[row["protein_id"]] = row
-    return by_id
-
-
-def save_table(by_id: Dict[str, Dict[str, str]], table_path: Path) -> None:
-    """Worst structures first: ERROR rows, then ascending non_loop_fraction."""
-    table_path.parent.mkdir(parents=True, exist_ok=True)
-
-    def sort_key(row: Dict[str, str]) -> tuple:
-        try:
-            non_loop = float(row.get("non_loop_fraction", ""))
-        except ValueError:
-            non_loop = float("-inf")
-        return (row.get("status") != "ERROR", non_loop, row.get("protein_id", ""))
-
-    with table_path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=RESULT_FIELDS)
-        writer.writeheader()
-        for row in sorted(by_id.values(), key=sort_key):
-            writer.writerow({field_name: row.get(field_name, "") for field_name in RESULT_FIELDS})
-
-
 # Step 2. Metrics and criteria.
+
+
+def _table_sort_key(row: Dict[str, str]) -> tuple:
+    """Worst structures first: ERROR rows, then ascending non_loop_fraction."""
+    try:
+        non_loop = float(row.get("non_loop_fraction", ""))
+    except ValueError:
+        non_loop = float("-inf")
+    return (row.get("status") != "ERROR", non_loop, row.get("protein_id", ""))
 
 
 def numeric_metric(metrics: Dict[str, Any], name: str) -> float:
@@ -395,7 +263,7 @@ def _scan_archive(stage: Path, experiment: str, tar_path: Path,
                         jp.sorted_raw_dir(stage, experiment, outcome))
 
             if report.scanned % CHECKPOINT_SIZE == 0:
-                save_table(by_id, table_path)
+                save_table(by_id, table_path, RESULT_FIELDS, _table_sort_key)
                 _log(f"  [checkpoint] {report.scanned} evaluated, table saved")
 
 
@@ -427,7 +295,7 @@ def run_filter(stage: Path, experiment: Optional[str] = None) -> FilterReport:
         if len(by_id) == before:
             continue
 
-        save_table(by_id, table_path)
+        save_table(by_id, table_path, RESULT_FIELDS, _table_sort_key)
         report.tables.append(table_path)
         for result in regroup_and_archive(stage, experiment_name):
             report.sorted_archives.append(result)
@@ -452,7 +320,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
     try:
         report = run_filter(args.stage.resolve(), args.experiment)
-    except (OSError, ValueError, Stage01InputError) as exc:
+    except (OSError, ValueError, ArchiveError, Stage01InputError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
     _log(f"[done] {report.summary()}")
@@ -461,3 +329,4 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

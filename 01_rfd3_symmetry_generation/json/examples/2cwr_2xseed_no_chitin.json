@@ -1,6 +1,6 @@
 {
   "trial": {
-    "input": "/home/karina/1cbh_clear/00_reference_structures/seed/chitin_trial.pdb",
+    "input": "/home/karina/1cbh_clear/00_reference_structures/seed/2cwr_2xseed_no_chitin.pdb",
     "contig": "25-35,A274-326,25-35",
     "length": "103-123",
     "is_non_loopy": true,

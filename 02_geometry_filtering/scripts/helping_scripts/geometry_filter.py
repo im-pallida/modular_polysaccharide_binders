@@ -8,9 +8,22 @@ clashes and contacts.
     sorted_clean/<experiment>/passed/<group>.tar.gz        <- this writes
     sorted_clean/<experiment>/rejected/<group>.tar.gz
 
+Why alignment is needed at all: RFD3 outputs the designed protein only. The
+fibril lives in the stage-01 seed, so the design is superposed back onto the
+seed's motif and the seed's non-protein chains are carried across. What gets
+written out is the aligned protein plus the polysaccharide -- which is what
+stage 03 consumes.
+
+Rule (unchanged from 15082026_01_clashes_and_contacts_filtering.py)
     protein-protein clashes  CA-CA <= 1.8 A   must be 0
     protein-ligand clashes   all-atom <= 2.2 A must be 0
     protein-protein contacts CA-CA in [4, 8]  must be >= 7
+
+Nothing about chains or seeds is hardcoded. The seed is found through the
+stage-01 json the group was generated from; protein and ligand chains are
+told apart by residue type; and the seed chain each generated chain aligns
+onto is read out of the json's own diffused_index_map, which already carries
+the seed chain letters in its keys.
 
 Statuses
     PASSED / REJECTED  the structure was evaluated and met or missed the cutoffs
@@ -38,6 +51,14 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "common"))
 import job_paths as jp  # noqa: E402
+from designs import (  # noqa: E402
+    DesignError,
+    design_config_for_group,
+    fixed_residue_map,
+    read_records,
+    split_map_key,
+)
+from structures import classify_chains  # noqa: E402
 from archives import (  # noqa: E402
     ArchiveError,
     extract_member,
@@ -51,7 +72,8 @@ import tarfile  # noqa: E402  (after the path setup, like the rest)
 
 STAGE = Path(__file__).resolve().parents[2]
 
-# Cutoffs
+# Cutoffs, kept exactly as the production run used them so its 16k rows stay
+# directly comparable with anything generated now.
 CLASH_MAX = 0
 LIGAND_CLASH_MAX = 0
 CONTACT_MIN = 7
@@ -61,12 +83,10 @@ LIGAND_CLASH_DISTANCE_A = 2.2
 CONTACT_MIN_DISTANCE_A = 4.0
 CONTACT_MAX_DISTANCE_A = 8.0
 
-# The tyrosine axis: the atoms the motif is fitted on.
-TYR_AXIS_ATOMS = ("CA", "CB", "CG", "CZ", "OH")
-
 CHECKPOINT_SIZE = 100
 
-# Protein-ligand distances are all-atom, so the pair count can be large.
+# Protein-ligand distances are all-atom, so the pair count can be large. Rows
+# of the distance matrix are computed in blocks to bound peak memory.
 DISTANCE_BLOCK = 512
 
 RESULT_FIELDS = [
@@ -137,27 +157,19 @@ class FilterReport:
                 f"{len(self.archives)} archive(s) updated")
 
 
-# Step 1. The seed
-
-
-def classify_chains(structure: gemmi.Structure) -> Tuple[List[str], List[str]]:
-    """(protein chains, everything else), decided by residue type.
-    """
-    protein: List[str] = []
-    ligand: List[str] = []
-    for chain in structure[0]:
-        is_protein = False
-        for residue in chain:
-            info = gemmi.find_tabulated_residue(residue.name)
-            if info is not None and info.is_amino_acid():
-                is_protein = True
-                break
-        (protein if is_protein else ligand).append(chain.name)
-    return protein, ligand
+# ---------------------------------------------------------------------------
+# Layer 1: the seed
+# ---------------------------------------------------------------------------
 
 
 def seed_for_group(stage: Path, experiment: str, group_key: str) -> Seed:
     """The seed a group was generated from.
+
+    group_key is the stage-01 json's filename stem, which job_name() encoded
+    into every structure's name and the transfer preserved in the archive
+    name. So the generating config -- and through it the seed -- is
+    recoverable from the archive path alone, with nothing recorded anywhere
+    along the way.
     """
     json_path = jp.stage01_json_path(stage, experiment, group_key)
     if not json_path.is_file():
@@ -205,29 +217,33 @@ def seed_for_group(stage: Path, experiment: str, group_key: str) -> Seed:
     return Seed(seed_path, structure, protein, ligand)
 
 
-# Step 2. Alignment
+# ---------------------------------------------------------------------------
+# Layer 2: alignment
+# ---------------------------------------------------------------------------
 
 
-def split_map_key(key: str) -> Tuple[str, int]:
-    """'A24' -> ('A', 24). Keys of diffused_index_map name seed residues, its
-    values name the generated residues they became."""
-    match = re.fullmatch(r"(.+?)(-?\d+)", key)
-    if not match:
-        raise GeometryError(f"cannot parse residue key {key!r}")
-    return match.group(1), int(match.group(2))
+def fixed_map_for(
+    records: Dict[str, Dict[str, str]], protein_id: str, config: dict, payload: dict
+) -> Tuple[Dict[str, str], List[str], bool]:
+    """{seed key: generated key} for the residues stage 01 fixed the side chains of.
 
+    Prefers the record stage 01 wrote as the structure was generated -- that is
+    a fact about what actually happened. Structures generated before the record
+    existed are not in it, so their set is derived from the design config and
+    the structure's own diffused_index_map instead, and the caller is told which
+    route was taken.
 
-def json_alignment(payload: dict) -> Tuple[dict, List[str]]:
-    """The two things alignment needs out of a structure's metadata json.
+    Returns (mapped, unmapped, derived).
     """
+    recorded = records.get(protein_id)
+    if recorded:
+        return dict(recorded), [], False
+
     diffused_index_map = payload.get("diffused_index_map")
     if not isinstance(diffused_index_map, dict) or not diffused_index_map:
         raise GeometryError("missing_diffused_index_map")
-    select_exposed = payload.get("specification", {}).get("select_exposed", "")
-    align_keys = [key.strip() for key in str(select_exposed).split(",") if key.strip()]
-    if not align_keys:
-        raise GeometryError("no_align_keys:specification.select_exposed is empty")
-    return diffused_index_map, align_keys
+    mapped, unmapped = fixed_residue_map(config, diffused_index_map)
+    return mapped, unmapped, True
 
 
 def index_by_chain_resi(structure: gemmi.Structure) -> Dict[str, Dict[int, Dict[str, np.ndarray]]]:
@@ -246,78 +262,86 @@ def index_by_chain_resi(structure: gemmi.Structure) -> Dict[str, Dict[int, Dict[
 
 
 def derive_seed_chains(
-    diffused_index_map: dict, align_keys: Sequence[str], seed_protein_chains: Sequence[str]
+    mapped: Dict[str, str], seed_protein_chains: Sequence[str]
 ) -> Tuple[str, str]:
-    """(directly-named seed chain, the other one).
+    """(the seed chain the motif sits in, the other one).
+
+    The keys of the fixed-residue map are seed residues, chain letter included,
+    so the chain is already in the data and never has to be configured.
     """
-    named = {split_map_key(key)[0] for key in align_keys if key in diffused_index_map}
+    named = {split_map_key(key)[0] for key in mapped}
     if len(named) != 1:
         raise GeometryError(
-            f"align keys must name exactly one seed chain, found {sorted(named)}"
+            f"the fixed residues name {sorted(named)} seed chains; expected exactly one"
         )
     direct = named.pop()
     if direct not in seed_protein_chains:
         raise GeometryError(
-            f"json names seed chain {direct!r}, but the seed's protein chains are "
-            f"{list(seed_protein_chains)}"
+            f"the fixed residues name seed chain {direct!r}, but the seed's protein "
+            f"chains are {list(seed_protein_chains)}"
         )
     mirrored = next(name for name in seed_protein_chains if name != direct)
     return direct, mirrored
 
 
 def assign_generated_chains(
-    generated_chains: Sequence[str], diffused_index_map: dict,
-    align_keys: Sequence[str], seed_chains: Tuple[str, str],
+    generated_chains: Sequence[str], mapped: Dict[str, str], seed_chains: Tuple[str, str]
 ) -> Dict[str, str]:
     """{generated chain: seed chain it aligns onto}.
+
+    One generated chain is named by the map's values; the other is its symmetry
+    copy and takes the seed's other chain.
     """
     if len(generated_chains) != 2:
         raise GeometryError(
             f"expected exactly two generated protein chains, found {list(generated_chains)}"
         )
-    named = {split_map_key(diffused_index_map[key])[0]
-             for key in align_keys if key in diffused_index_map}
+    named = {split_map_key(value)[0] for value in mapped.values()}
     if len(named) != 1:
         raise GeometryError(
-            f"align keys must map to exactly one generated chain, found {sorted(named)}"
+            f"the fixed residues map to {sorted(named)} generated chains; expected one"
         )
     direct = named.pop()
     if direct not in generated_chains:
         raise GeometryError(
-            f"json maps to chain {direct!r}, but the generated chains are "
-            f"{list(generated_chains)}"
+            f"the fixed residues map to chain {direct!r}, but the generated chains "
+            f"are {list(generated_chains)}"
         )
     mirrored = next(name for name in generated_chains if name != direct)
     return {direct: seed_chains[0], mirrored: seed_chains[1]}
 
 
 def build_alignment_pairs(
-    seed_index: dict, generated_index: dict, diffused_index_map: dict,
-    align_keys: Sequence[str], seed_chain: str, generated_chain: str,
-    fit_atom_names: Sequence[str] = TYR_AXIS_ATOMS,
+    seed_index: dict, generated_index: dict, mapped: Dict[str, str],
+    seed_chain: str, generated_chain: str,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Matched (generated, seed) coordinate arrays for one chain pair.
+    """Matched (generated, seed) coordinates for one chain pair.
+
+    Fits on EVERY atom the two residues share. "ALL" in select_fixed_atoms means
+    RFD3 was told to preserve the whole residue, side chain included, so all of
+    it is legitimate to fit on -- and unlike a fixed tyrosine-atom list, this
+    works whatever the residue happens to be.
     """
     generated_coords: List[np.ndarray] = []
     seed_coords: List[np.ndarray] = []
-    for key in align_keys:
-        if key not in diffused_index_map:
-            continue
-        _, seed_resi = split_map_key(key)
-        _, generated_resi = split_map_key(diffused_index_map[key])
+    for seed_key, generated_key in sorted(mapped.items()):
+        _, seed_resi = split_map_key(seed_key)
+        _, generated_resi = split_map_key(generated_key)
         seed_residue = seed_index.get(seed_chain, {}).get(seed_resi)
         generated_residue = generated_index.get(generated_chain, {}).get(generated_resi)
         if seed_residue is None or generated_residue is None:
             continue
-        for atom_name in fit_atom_names:
-            if atom_name in seed_residue and atom_name in generated_residue:
-                seed_coords.append(seed_residue[atom_name])
-                generated_coords.append(generated_residue[atom_name])
+        for atom_name in sorted(set(seed_residue) & set(generated_residue)):
+            seed_coords.append(seed_residue[atom_name])
+            generated_coords.append(generated_residue[atom_name])
     return np.array(generated_coords), np.array(seed_coords)
 
 
 def kabsch(moving: np.ndarray, fixed: np.ndarray) -> Tuple[np.ndarray, np.ndarray, float]:
     """Rigid transform taking `moving` onto `fixed`, plus the fit rmsd.
+
+    Centred SVD with the determinant forced positive, so a reflection is never
+    returned as a fit -- a mirrored protein is not the same protein.
     """
     if moving.shape[0] < 3:
         raise GeometryError(f"need at least 3 fit atoms, got {moving.shape[0]}")
@@ -333,7 +357,9 @@ def kabsch(moving: np.ndarray, fixed: np.ndarray) -> Tuple[np.ndarray, np.ndarra
     return rotation, translation, rmsd
 
 
-# Step 3. Geometry
+# ---------------------------------------------------------------------------
+# Layer 3: geometry
+# ---------------------------------------------------------------------------
 
 
 def _blocked_min_distances(a: np.ndarray, b: np.ndarray):
@@ -388,8 +414,9 @@ def decide_status(
     return ("REJECTED" if reasons else "PASSED"), reasons
 
 
-
-# Step 4. Rows
+# ---------------------------------------------------------------------------
+# Layer 4: rows
+# ---------------------------------------------------------------------------
 
 
 def build_row(protein_id: str, experiment: str, seed: Optional[Seed], status: str,
@@ -431,7 +458,9 @@ def table_sort_key(row: Dict[str, str]) -> tuple:
     return (rank, contacts, row.get("protein_id", ""))
 
 
-# Step 5. One structure
+# ---------------------------------------------------------------------------
+# Layer 5: one structure
+# ---------------------------------------------------------------------------
 
 
 def _coords_and_resi(structure: gemmi.Structure, chain_name: str,
@@ -484,20 +513,16 @@ def attach_ligand(target: gemmi.Structure, seed: Seed) -> None:
         target[0].add_chain(copied)
 
 
-def evaluate_structure(structure: gemmi.Structure, payload: dict, seed: Seed
+def evaluate_structure(structure: gemmi.Structure, mapped: Dict[str, str], seed: Seed
                        ) -> Tuple[float, int, List[Tuple[int, int]], int, int]:
     """Align, attach the ligand, and count. Mutates `structure` into the
     aligned, ligand-bearing form that gets written out.
 
     Returns (rmsd, clash_count, clashing_residues, contact_count, ligand_clashes).
     """
-    diffused_index_map, align_keys = json_alignment(payload)
     generated_protein, _ = classify_chains(structure)
-
-    seed_chains = derive_seed_chains(diffused_index_map, align_keys, seed.protein_chains)
-    assignment = assign_generated_chains(
-        generated_protein, diffused_index_map, align_keys, seed_chains
-    )
+    seed_chains = derive_seed_chains(mapped, seed.protein_chains)
+    assignment = assign_generated_chains(generated_protein, mapped, seed_chains)
 
     seed_index = index_by_chain_resi(seed.structure)
     generated_index = index_by_chain_resi(structure)
@@ -506,8 +531,7 @@ def evaluate_structure(structure: gemmi.Structure, payload: dict, seed: Seed
     rmsds: List[float] = []
     for generated_chain, seed_chain in assignment.items():
         moving, fixed = build_alignment_pairs(
-            seed_index, generated_index, diffused_index_map, align_keys,
-            seed_chain, generated_chain,
+            seed_index, generated_index, mapped, seed_chain, generated_chain,
         )
         rotation, translation, chain_rmsd = kabsch(moving, fixed)
         transforms[generated_chain] = (rotation, translation)
@@ -536,7 +560,10 @@ def evaluate_structure(structure: gemmi.Structure, payload: dict, seed: Seed
     return (max(rmsds), clash_count, clashing, contact_count, ligand_clash_count)
 
 
-# Step 6. Orchestrator
+# ---------------------------------------------------------------------------
+# Layer 6: orchestrator
+# ---------------------------------------------------------------------------
+
 
 def archives_to_scan(stage: Path, experiment: Optional[str] = None) -> Dict[str, List[Path]]:
     """{experiment: [inputs/<experiment>/<group>.tar.gz, ...]}."""
@@ -554,13 +581,15 @@ def archives_to_scan(stage: Path, experiment: Optional[str] = None) -> Dict[str,
 
 def _scan_archive(stage: Path, experiment: str, tar_path: Path,
                   by_id: Dict[str, Dict[str, str]], table_path: Path,
-                  report: FilterReport) -> None:
+                  report: FilterReport,
+                  records: Dict[str, Dict[str, str]]) -> None:
     group_key = tar_path.name[: -len(".tar.gz")]
     scratch_dir = jp.sorted_scratch_dir(stage, experiment)
 
     try:
         seed = seed_for_group(stage, experiment, group_key)
-    except SeedError as exc:
+        _, config = design_config_for_group(stage, experiment, group_key)
+    except (SeedError, DesignError) as exc:
         seed = None
         seed_problem = str(exc)
     else:
@@ -606,12 +635,18 @@ def _scan_archive(stage: Path, experiment: str, tar_path: Path,
             json_path = extract_member(archive, members["json"], scratch_dir)
             try:
                 payload = json.loads(json_path.read_text(encoding="utf-8"))
+                mapped, unmapped, derived = fixed_map_for(
+                    records, protein_id, config, payload
+                )
+                if unmapped:
+                    _log(f"  [note] {protein_id}: {len(unmapped)} fixed residue(s) "
+                         f"{unmapped} are not in diffused_index_map; fitting on the rest")
                 structure = gemmi.read_structure(str(structure_path))
                 structure.setup_entities()
                 rmsd, clashes, clashing, contacts, ligand_hits = evaluate_structure(
-                    structure, payload, seed
+                    structure, mapped, seed
                 )
-            except (GeometryError, OSError, RuntimeError, ValueError,
+            except (GeometryError, DesignError, OSError, RuntimeError, ValueError,
                     json.JSONDecodeError) as exc:
                 record("ERROR", skip_reason=str(exc).splitlines()[0])
                 _log(f"  {protein_id}: ERROR ({str(exc).splitlines()[0]})")
@@ -657,11 +692,16 @@ def run_geometry_filter(stage: Path, experiment: Optional[str] = None) -> Filter
         table_path = jp.results_table_path(stage, experiment_name)
         by_id = load_table(table_path)
         before = len(by_id)
+        # What stage 01 recorded as it generated. Absent for anything made
+        # before the record existed, which falls back to deriving the set.
+        records = read_records(jp.fixed_residues_path(jp.stage01_root(stage), experiment_name))
         _log(f"[geometry] {experiment_name}: {len(tar_paths)} archive(s), "
-             f"{before} structure(s) already filtered")
+             f"{before} structure(s) already filtered, "
+             f"{len(records)} with a recorded fixed-residue set")
 
         for tar_path in tar_paths:
-            _scan_archive(stage, experiment_name, tar_path, by_id, table_path, report)
+            _scan_archive(stage, experiment_name, tar_path, by_id, table_path,
+                          report, records)
 
         if len(by_id) == before:
             continue
