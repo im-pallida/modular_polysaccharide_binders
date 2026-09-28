@@ -42,6 +42,35 @@ def split_map_key(key: str) -> Tuple[str, int]:
     return match.group(1), int(match.group(2))
 
 
+RESIDUE_KEY = re.compile(r"^\s*([A-Za-z])(\d+)(?:-(\d+))?\s*$")
+
+
+def expand_residue_key(key: str) -> List[str]:
+    """'B5' -> ['B5']; 'B28-32' -> ['B28','B29','B30','B31','B32'].
+
+    select_fixed_atoms accepts a range for a run of residues, and every caller
+    downstream works one residue at a time -- diffused_index_map is keyed per
+    residue, and so is everything derived from it. Expanding here is what lets
+    both spellings mean the same thing.
+
+    Without this the range form is not rejected, it is misread: split_map_key
+    backtracks 'B28-32' into chain 'B28', residue -32, which matches nothing in
+    diffused_index_map, so those five residues are quietly never held and no
+    error is raised anywhere.
+
+    An unparseable key returns empty rather than raising: the callers decide
+    what an unusable config means, and they already do.
+    """
+    match = RESIDUE_KEY.match(str(key))
+    if not match:
+        return []
+    chain, first = match.group(1), int(match.group(2))
+    last = int(match.group(3)) if match.group(3) else first
+    if last < first:
+        return []
+    return [f"{chain}{number}" for number in range(first, last + 1)]
+
+
 def referenced_residues(config: dict) -> Set[Tuple[str, int]]:
     """(chain, residue number) pairs a design config points at.
 
@@ -59,9 +88,10 @@ def referenced_residues(config: dict) -> Set[Tuple[str, int]]:
             wanted |= {(chain, n) for n in range(first, last + 1)}
 
     for key in config.get("select_fixed_atoms", {}) or {}:
-        match = re.fullmatch(r"([A-Za-z])(\d+)", str(key))
-        if match:
-            wanted.add((match.group(1), int(match.group(2))))
+        for expanded in expand_residue_key(key):
+            match = re.fullmatch(r"([A-Za-z])(\d+)", expanded)
+            if match:
+                wanted.add((match.group(1), int(match.group(2))))
 
     for key in str(config.get("select_exposed", "")).split(","):
         match = re.fullmatch(r"\s*([A-Za-z])(\d+)\s*", key)
@@ -121,14 +151,18 @@ def fixed_residues(config: dict) -> List[str]:
     constrained, so their side-chain identity was never preserved and there is
     nothing there worth freezing or fitting on.
 
-    Returns seed-numbered keys ('B5', 'B29'), sorted. Empty when the config has
-    no select_fixed_atoms, which the caller must treat as "this design cannot
-    be aligned or redesigned" rather than as zero work to do.
+    Returns seed-numbered keys ('B5', 'B29'), sorted, one per residue: a range
+    key like 'B28-32' is expanded, because everything downstream is keyed per
+    residue. Empty when the config has no select_fixed_atoms, which the caller
+    must treat as "this design cannot be aligned or redesigned" rather than as
+    zero work to do.
     """
     selected = config.get("select_fixed_atoms", {}) or {}
-    keys = [str(key) for key, value in selected.items()
-            if str(value).strip().upper() == FIXED_ALL]
-    return sorted(keys, key=lambda key: (split_map_key(key)[0], split_map_key(key)[1]))
+    keys = [expanded for key, value in selected.items()
+            if str(value).strip().upper() == FIXED_ALL
+            for expanded in expand_residue_key(key)]
+    return sorted(set(keys),
+                  key=lambda key: (split_map_key(key)[0], split_map_key(key)[1]))
 
 
 def fixed_residue_map(config: dict, diffused_index_map: dict) -> Tuple[Dict[str, str], List[str]]:
@@ -203,4 +237,3 @@ def read_records(path: Path) -> Dict[str, Dict[str, str]]:
             except (json.JSONDecodeError, KeyError, TypeError) as exc:
                 raise DesignError(f"{path}:{lineno}: malformed record: {exc}")
     return records
-

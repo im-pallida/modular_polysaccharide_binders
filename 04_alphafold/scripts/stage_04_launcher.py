@@ -2,11 +2,12 @@
 """
 Runs stage 04 end to end:
 
-1. Builds one AlphaFold3 json per designed sequence -- monomer only;
+1. Builds one AlphaFold3 json per designed sequence -- one chain, with the
+   fibril it was designed against;
 2. Folds each one, four at a time on the cluster, one at a time otherwise;
-3. Scores every folded monomer against the backbone ProteinMPNN designed it
+3. Scores every folded monomer against the backbone LigandMPNN designed it
    onto, and sorts it passed or rejected;
-4. Hands the passed folds to stage 05;
+4. Hands the passed folds to stage 05, the linker stage;
 5. Clears outputs/, af3_runs/ and the input jsons for everything the archives
    already hold. What is needed lives in a tar.gz; what is not is removed.
 
@@ -47,7 +48,13 @@ sys.path.insert(0, str(HELPING_SCRIPTS_DIR))
 import job_paths as jp  # noqa: E402
 from af3_prepare import PrepareError, run_prepare  # noqa: E402
 from run_af3 import Af3Error, run_af3  # noqa: E402
-from score_designs import run_scoring  # noqa: E402
+from score_designs import (  # noqa: E402
+    FRACTION_THRESHOLD,
+    MIN_SITE_CONTACT,
+    RMSD_THRESHOLD,
+    SITE_CONTACT_CUTOFF,
+    run_scoring,
+)
 from cleanup import run_cleanup  # noqa: E402
 from transfer_to_stage05 import TransferError, run_transfer  # noqa: E402
 
@@ -56,9 +63,10 @@ def _log(*parts: object) -> None:
     print(*parts, flush=True)
 
 
-def prepare_jsons(stage: Path, experiment: Optional[str]) -> bool:
+def prepare_jsons(stage: Path, experiment: Optional[str],
+                  ccd_code: Optional[str] = None) -> bool:
     try:
-        report = run_prepare(stage, experiment)
+        report = run_prepare(stage, experiment, ccd_code)
     except (PrepareError, OSError) as exc:
         _log(f"[prepare] FAILED: {exc}")
         return False
@@ -79,8 +87,10 @@ def fold_sequences(stage: Path, experiment: Optional[str], max_concurrent: int) 
 
 
 def score_and_sort(stage: Path, experiment: Optional[str],
-                   max_rmsd: float, min_fraction: float) -> bool:
-    report = run_scoring(stage, experiment, max_rmsd, min_fraction)
+                   max_rmsd: float, min_fraction: float,
+                   min_site_contact: float) -> bool:
+    report = run_scoring(stage, experiment, max_rmsd, min_fraction,
+                         min_site_contact)
     _log(f"[score] {report.summary()}")
     for table in report.tables:
         _log(f"[score] results -> {table}")
@@ -90,7 +100,7 @@ def score_and_sort(stage: Path, experiment: Optional[str],
 
 
 def hand_over(stage: Path, experiment: Optional[str]) -> bool:
-    _log("[transfer] handing the passed folds to stage 05...")
+    _log("[transfer] handing the passed folds to stage 05 (linker)...")
     try:
         report = run_transfer(stage, experiment)
     except (OSError, TransferError) as exc:
@@ -111,12 +121,23 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument("--stage", type=Path, default=STAGE_ROOT)
+    parser.add_argument("--ccd-code", default=None,
+                        help="force this CCD code for every ligand unit instead of "
+                             "the residue name (cellulose is BGC, chitin NAG)")
     parser.add_argument("--experiment", default=None,
                         help="only this experiment (default: every outstanding one)")
-    parser.add_argument("--max-rmsd", type=float, default=5.0,
-                        help="pass below this RMSD (default: 5.0)")
-    parser.add_argument("--min-fraction", type=float, default=0.8,
-                        help="pass above this matched fraction (default: 0.8)")
+    parser.add_argument("--max-rmsd", type=float, default=RMSD_THRESHOLD,
+                        help=f"pass below this RMSD (default: {RMSD_THRESHOLD})")
+    parser.add_argument("--min-fraction", type=float, default=FRACTION_THRESHOLD,
+                        help=f"pass above this matched fraction "
+                             f"(default: {FRACTION_THRESHOLD})")
+    parser.add_argument("--min-site-contact", type=float, default=MIN_SITE_CONTACT,
+                        help=f"reject a fold unless this fraction of the seed's "
+                             f"ALL-fixed residues is still within "
+                             f"{SITE_CONTACT_CUTOFF:.1f} A of the fibre "
+                             f"(default: {MIN_SITE_CONTACT}, meaning record only). "
+                             f"Run helping_scripts/site_contacts.py first to see "
+                             f"what these seeds support")
     parser.add_argument("--max-concurrent", type=int, default=4,
                         help="cluster jobs in flight (default: 4, the account cap)")
     parser.add_argument("--no-fold", action="store_true",
@@ -140,7 +161,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         _log(f"[stage 04] nothing handed over yet: {jp.inputs_root(stage)} does not exist")
         return 0
 
-    prepared_ok = prepare_jsons(stage, args.experiment)
+    prepared_ok = prepare_jsons(stage, args.experiment, args.ccd_code)
 
     folded_ok = True
     if not args.no_fold:
@@ -150,7 +171,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     scored_ok = True
     if not args.no_score:
-        scored_ok = score_and_sort(stage, args.experiment, args.max_rmsd, args.min_fraction)
+        scored_ok = score_and_sort(stage, args.experiment, args.max_rmsd,
+                                   args.min_fraction, args.min_site_contact)
 
     # Runs even with --no-score: scoring may have happened on an earlier run,
     # and transferring what already passed should not need a rescore.

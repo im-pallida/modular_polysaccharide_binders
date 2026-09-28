@@ -1,0 +1,11 @@
+{
+  "1cbh_1xcellulose_dp20_00019312_BA": {
+    "input": "/home/karina/1cbh_clear/06_rfd3_linker_generation/inputs_prepared/examples/1cbh_1xcellulose_dp20/1cbh_1xcellulose_dp20_00019312.pdb",
+    "contig": "B1-93,16-28,A1-93",
+    "length": "202-214",
+    "select_fixed_atoms": {
+      "A1-93": "ALL",
+      "B1-93": "ALL"
+    }
+  }
+}

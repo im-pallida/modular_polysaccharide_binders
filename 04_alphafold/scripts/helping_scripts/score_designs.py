@@ -2,9 +2,9 @@
 """
 Stage 04, step 3: score every folded monomer and sort it passed or rejected.
 
-    outputs/<sequence_id>_monomer/                      <- AF3 wrote
-    ../03_protein_mpnn/inputs_prepared/<experiment>/<group>/<protein_id>.pdb
-                                                        <- the reference
+    outputs/<sequence_id>_ligand/                       <- AF3 wrote
+    inputs/<experiment>/<group>.tar.gz                  <- the reference complex,
+                                                           sent by stage 03
     sorted_clean/<experiment>/<passed|rejected>/<group>.tar.gz
     tables/stage_04_results_<experiment>.csv
 
@@ -18,16 +18,36 @@ A sequence passes when rmsd < RMSD_THRESHOLD and matched_fraction > FRACTION.
 Of AF3's samples, only the one AF3 ranks first is scored -- that is the
 prediction you would use, so the verdict should be about it.
 
-The reference is read straight out of stage 03's inputs_prepared/, the exact
-backbone ProteinMPNN designed the sequence onto. No copy is kept here: the old
-transfer step duplicated those files into inputs/reference/, and the duplicate
-went stale the moment stage 03 changed its layout.
+The reference is the complex stage 03 designed onto, which travels in the input
+archive beside the sequences. Only its protein is used here -- one chain of the
+tied dimer, since the prediction is a monomer. The fibril in both structures is
+ignored by the RMSD: every polysaccharide residue maps to 'X', which
+protein_chains() excludes, so the ligand can be present in the fold without
+entering the metric.
 
 site_rmsd is a diagnostic, never a gate. After superposing on the pruned core,
 it measures the deviation at the scaffolded residues alone -- the "ALL" fixed
 side chains stage 01 recorded. A design can have an excellent whole-chain RMSD
 while the binding site itself has drifted, and that column is where you would
 see it. Blank when stage 01 recorded no fixed residues for that structure.
+
+The contact columns answer a question RMSD cannot. RMSD is measured after
+superposition, so it says whether the FOLD is right and nothing at all about
+where that fold ended up relative to the fibre it was given: a design that folds
+beautifully and drifts off into solvent scores exactly as well as one sitting on
+the cellulose. So the prediction is also measured in its own coordinates --
+
+    site_contacts / site_contact_fraction   how many of the ALL-fixed residues
+                                            are still within SITE_CONTACT_CUTOFF
+                                            of the fibre, heavy atom to heavy atom
+    site_closest                            the nearest of them
+    chain_closest                           the nearest approach of the whole
+                                            monomer, which is the blunt "is it
+                                            on the fibre at all" number
+
+-- and site_contact_fraction is a gate when --min-site-contact is above zero.
+It is zero by default because the right value is a property of these seeds, not
+of the method: site_contacts.py measures it and prints the number to pass.
 """
 from __future__ import annotations
 
@@ -50,17 +70,44 @@ except ImportError:  # pragma: no cover - environment problem, not a code path
         "       pip install biopython, into the same environment as gemmi and numpy."
     )
 
+try:
+    import gemmi
+except ImportError:  # pragma: no cover - environment problem, not a code path
+    raise SystemExit(
+        "ERROR: gemmi is not installed in this interpreter.\n"
+        "       pip install gemmi, into the same environment as biopython and numpy."
+    )
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "common"))
 import job_paths as jp  # noqa: E402
 from archives import load_table, merge_members_into_archive, save_table  # noqa: E402
 from designs import generated_positions, read_records  # noqa: E402
+from structures import (  # noqa: E402
+    SITE_CONTACT_CUTOFF,
+    StructureError,
+    chain_approach,
+    classify_chains,
+    most_contacted,
+    site_approaches,
+)
 
 STAGE = Path(__file__).resolve().parents[2]
 
-RMSD_THRESHOLD = 5.0
+RMSD_THRESHOLD = 2.5
 FRACTION_THRESHOLD = 0.8
 PRUNE_CUTOFF = 2.0
 MAX_ITERATIONS = 5
+
+# What fraction of the seed's ALL-fixed residues must still be within
+# SITE_CONTACT_CUTOFF of the fibre in the prediction. Zero means the columns are
+# filled in but nothing is rejected on them.
+#
+# Off by default on purpose. The right value depends on whether every ALL-fixed
+# residue in these seeds is a binding residue, which only the seeds know --
+# site_contacts.py measures it and prints the number to pass. A gate guessed too
+# high rejects everything and reads exactly like a stage that ran and found
+# nothing, which has already cost time here more than once.
+MIN_SITE_CONTACT = 0.0
 
 AA3TO1 = {
     "ALA": "A", "ARG": "R", "ASN": "N", "ASP": "D", "CYS": "C",
@@ -72,7 +119,9 @@ AA3TO1 = {
 RESULT_FIELDS = [
     "sequence_id", "protein_id", "experiment_name", "group", "time_stamp",
     "rmsd", "matched_pairs", "total_aligned_pairs", "matched_fraction",
-    "ranking_score", "site_rmsd", "site_residues", "status",
+    "ranking_score", "site_rmsd", "site_residues",
+    "site_contacts", "site_contact_fraction", "site_closest", "chain_closest",
+    "status",
 ]
 
 
@@ -107,6 +156,7 @@ class ScoreReport:
     not_folded: int = 0
     already: int = 0
     no_site: int = 0
+    off_fibre: int = 0
     tables: List[Path] = field(default_factory=list)
     problems: List[str] = field(default_factory=list)
 
@@ -293,24 +343,104 @@ def matchmaker(moving: Chain, target: Chain,
     return fit, pairs
 
 
-def site_deviation(fit: Fit, pairs: Sequence[Tuple[int, int]], moving: Chain,
-                   target: Chain, site_residues: Sequence[int]) -> Tuple[Optional[float], int]:
+def site_pairs(pairs: Sequence[Tuple[int, int]], target: Chain,
+               site_residues: Sequence[int]) -> List[Tuple[int, int]]:
+    """The aligned pairs that land on the scaffolded residues.
+
+    Shared by the two site measurements, because they have to be talking about
+    the same residues or the columns beside each other in the table mean
+    different things. Selection is by residue number in the REFERENCE and then
+    carried across the alignment, since AlphaFold renumbers its output from 1
+    and the seed does not: matching the numbers directly would silently select
+    the wrong residues whenever the seed's numbering did not start at 1.
+    """
+    wanted = set(site_residues)
+    target_indices = {index for index, number in enumerate(target.residue_numbers)
+                      if number in wanted}
+    return [(i, j) for i, j in pairs if j in target_indices]
+
+
+def site_deviation(fit: Fit, selected: Sequence[Tuple[int, int]], moving: Chain,
+                   target: Chain) -> Tuple[Optional[float], int]:
     """RMSD at the scaffolded residues under the whole-chain superposition.
 
     Not its own fit: superposing five atoms on five atoms would fit almost
     anything. The question is where the site landed once the fold as a whole
     was aligned.
     """
-    wanted = set(site_residues)
-    target_indices = {index for index, number in enumerate(target.residue_numbers)
-                      if number in wanted}
-    selected = [(i, j) for i, j in pairs if j in target_indices]
     if not selected:
         return None, 0
     moved = fit.apply(np.array([moving.coords[i] for i, _ in selected]))
     reference = np.array([target.coords[j] for _, j in selected])
     deviation = moved - reference
     return float(np.sqrt((deviation ** 2).sum(axis=1).mean())), len(selected)
+
+
+# ---------------------------------------------------------------------------
+# Did the prediction stay on the fibre?
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Contacts:
+    """How much of the designed interface AlphaFold kept."""
+    contacting: int
+    measured: int
+    site_closest: Optional[float]
+    chain_closest: Optional[float]
+
+    @property
+    def fraction(self) -> float:
+        return self.contacting / self.measured if self.measured else 0.0
+
+
+def contact_report(cif_path: Path, residue_numbers: Sequence[int],
+                   cutoff: float = SITE_CONTACT_CUTOFF) -> Contacts:
+    """Where the prediction sits relative to the fibre it was folded with.
+
+    Measured in AlphaFold's OWN coordinates, not after superposing onto the
+    seed. That is the whole point of the check: superpose first and the answer
+    is almost the RMSD again, because a fold that matches the design is by
+    construction sitting where the design sat. Asking it in the prediction's
+    own frame asks the different and more useful question -- given the fibre
+    right there, did AlphaFold keep the protein on it, or fold a perfectly good
+    domain floating in solvent?
+    """
+    structure = gemmi.read_structure(str(cif_path))
+    structure.setup_entities()
+    protein_chains, ligand_chains = classify_chains(structure)
+    if not protein_chains:
+        raise ScoreError(f"{cif_path.name}: no protein chain")
+    if not ligand_chains:
+        raise ScoreError(
+            f"{cif_path.name}: the prediction has no ligand chain, so it was "
+            f"folded without the fibre -- check the json that produced it"
+        )
+    ligand, _ = most_contacted(structure, protein_chains, ligand_chains)
+    chain = protein_chains[0]
+
+    approaches = site_approaches(structure, chain, residue_numbers, ligand)
+    contacting = sum(1 for distance in approaches.values() if distance <= cutoff)
+    return Contacts(
+        contacting=contacting,
+        measured=len(approaches),
+        site_closest=min(approaches.values()) if approaches else None,
+        chain_closest=chain_approach(structure, chain, ligand),
+    )
+
+
+def verdict(rmsd: float, matched_fraction: float, contacts: Optional[Contacts],
+            rmsd_threshold: float, fraction_threshold: float,
+            min_site_contact: float) -> Tuple[bool, bool]:
+    """(passed, on_fibre) -- the whole pass decision, in one place.
+
+    contacts is None when stage 01 recorded no fixed residues for this design.
+    Such a fold is judged on the rest rather than rejected, because a gap in a
+    record is not evidence about a structure.
+    """
+    on_fibre = contacts is None or contacts.fraction >= min_site_contact
+    return (rmsd < rmsd_threshold
+            and matched_fraction > fraction_threshold
+            and on_fibre), on_fibre
 
 
 # ---------------------------------------------------------------------------
@@ -430,17 +560,71 @@ def discover(stage: Path, experiment: str) -> List[Tuple[str, str, str]]:
     return found
 
 
+def reference_text(stage: Path, experiment: str, group_key: str,
+                   protein_id: str) -> str:
+    """The complex the sequence was designed on, as pdb text.
+
+    Read from the input archive first, because stage 03 sends the complex along
+    with the designs precisely so that this does not have to reach across into
+    another stage's working directory -- which breaks the moment stage 03 is
+    cleaned. The old location is still tried, so archives written before the
+    complex travelled can still be scored.
+    """
+    archive_path = jp.input_archive_path(stage, experiment, group_key)
+    if archive_path.is_file():
+        wanted = f"{protein_id}/{protein_id}.pdb"
+        with tarfile.open(archive_path, "r:gz") as archive:
+            for name in archive.getnames():
+                if (name[2:] if name.startswith("./") else name) == wanted:
+                    handle = archive.extractfile(name)
+                    if handle is not None:
+                        return handle.read().decode("utf-8")
+
+    legacy = jp.prepared_dir(jp.stage03_root(stage), experiment, group_key) / f"{protein_id}.pdb"
+    if legacy.is_file():
+        return legacy.read_text(encoding="utf-8")
+    raise ScoreError(
+        f"no reference complex for {protein_id}: not in {archive_path.name} as "
+        f"{protein_id}/{protein_id}.pdb, and not at {legacy}"
+    )
+
+
+def passthrough_member(stage: Path, experiment: str, group_key: str,
+                       member: str) -> Optional[bytes]:
+    """One member of the input archive, verbatim, or None if it is not there.
+
+    For the small provenance files that stage 03 sends and stage 05 needs, and
+    that this stage only has to hand on without reading.
+    """
+    archive_path = jp.input_archive_path(stage, experiment, group_key)
+    if not archive_path.is_file():
+        return None
+    with tarfile.open(archive_path, "r:gz") as archive:
+        for name in archive.getnames():
+            if (name[2:] if name.startswith("./") else name) == member:
+                handle = archive.extractfile(name)
+                if handle is not None:
+                    return handle.read()
+    return None
+
+
 def reference_chain(stage: Path, experiment: str, group_key: str,
-                    protein_id: str) -> Chain:
-    path = jp.prepared_dir(jp.stage03_root(stage), experiment, group_key) / f"{protein_id}.pdb"
-    if not path.is_file():
-        raise ScoreError(f"no reference backbone at {path}")
-    chains = protein_chains(chains_from_pdb(path.read_text(encoding="utf-8")))
+                    protein_id: str,
+                    cache: Optional[Dict[Tuple[str, str], Chain]] = None) -> Chain:
+    key = (group_key, protein_id)
+    if cache is not None and key in cache:
+        return cache[key]
+    text = reference_text(stage, experiment, group_key, protein_id)
+    chains = protein_chains(chains_from_pdb(text))
     if not chains:
-        raise ScoreError(f"{path.name}: no protein chain found")
+        raise ScoreError(f"{protein_id}: no protein chain in the reference complex")
     # The design is a tied homodimer, so both chains carry the same sequence;
     # the first is the monomer's counterpart. Not hardcoded to 'A' because
-    # nothing upstream guarantees what the chains are called.
+    # nothing upstream guarantees what the chains are called. The fibril is not
+    # among them: every one of its residues maps to 'X', which protein_chains
+    # excludes.
+    if cache is not None:
+        cache[key] = chains[0]
     return chains[0]
 
 
@@ -452,19 +636,23 @@ def predicted_chain(cif_path: Path) -> Chain:
 
 
 def score_experiment(stage: Path, experiment: str, report: ScoreReport,
-                     rmsd_threshold: float, fraction_threshold: float) -> None:
+                     rmsd_threshold: float, fraction_threshold: float,
+                     min_site_contact: float = MIN_SITE_CONTACT) -> None:
     table_path = jp.results_table_path(stage, experiment)
     by_id = load_table(table_path, key="sequence_id")
     before = len(by_id)
 
     records = read_records(jp.fixed_residues_path(jp.stage01_root(stage), experiment))
     pending: Dict[Tuple[str, str], List[Tuple[tarfile.TarInfo, bytes]]] = {}
+    # One complex serves all of its designs; re-opening the archive per sequence
+    # would read the same member three times for nothing.
+    references: Dict[Tuple[str, str], Chain] = {}
 
     for group_key, protein_id, sequence_id in discover(stage, experiment):
         if sequence_id in by_id:
             report.already += 1
             continue
-        job_name = jp.af3_job_name(sequence_id)
+        job_name = jp.af3_job_name(sequence_id, jp.LIGAND_SUFFIX)
         if not jp.af3_output_dir(stage, job_name).is_dir():
             report.not_folded += 1
             continue
@@ -472,27 +660,39 @@ def score_experiment(stage: Path, experiment: str, report: ScoreReport,
         try:
             cif_path, score = best_sample(stage, job_name)
             moving = predicted_chain(cif_path)
-            target = reference_chain(stage, experiment, group_key, protein_id)
+            target = reference_chain(stage, experiment, group_key, protein_id,
+                                     references)
             fit, pairs = matchmaker(moving, target)
 
             site_value: Optional[float] = None
             site_count = 0
+            contacts: Optional[Contacts] = None
             mapped = records.get(protein_id)
             if mapped:
                 positions = generated_positions(mapped, [target.chain_id])[target.chain_id]
-                site_value, site_count = site_deviation(fit, pairs, moving, target, positions)
+                selected = site_pairs(pairs, target, positions)
+                site_value, site_count = site_deviation(fit, selected, moving, target)
+                # The prediction's own numbering for the same residues: AF3
+                # renumbers from 1, so the seed's numbers would select nothing.
+                contacts = contact_report(
+                    cif_path, [moving.residue_numbers[i] for i, _ in selected]
+                )
             if site_value is None:
                 report.no_site += 1
-        except (ScoreError, OSError, ValueError, KeyError) as exc:
+        except (ScoreError, StructureError, OSError, ValueError, KeyError) as exc:
             report.problems.append(f"{experiment}/{sequence_id}: {exc}")
             _log(f"[score] {sequence_id}: FAILED ({exc})")
             continue
 
-        passed = fit.rmsd < rmsd_threshold and fit.matched_fraction > fraction_threshold
+        passed, on_fibre = verdict(fit.rmsd, fit.matched_fraction, contacts,
+                                   rmsd_threshold, fraction_threshold,
+                                   min_site_contact)
         status = "PASSED" if passed else "REJECTED"
         report.evaluated += 1
         report.passed += int(passed)
         report.rejected += int(not passed)
+        if not on_fibre:
+            report.off_fibre += 1
 
         by_id[sequence_id] = {
             "sequence_id": sequence_id,
@@ -507,17 +707,57 @@ def score_experiment(stage: Path, experiment: str, report: ScoreReport,
             "ranking_score": "" if score is None else f"{score:.4f}",
             "site_rmsd": "" if site_value is None else f"{site_value:.4f}",
             "site_residues": str(site_count),
+            "site_contacts": "" if contacts is None else str(contacts.contacting),
+            "site_contact_fraction": "" if contacts is None else f"{contacts.fraction:.4f}",
+            "site_closest": ("" if contacts is None or contacts.site_closest is None
+                             else f"{contacts.site_closest:.2f}"),
+            "chain_closest": ("" if contacts is None or contacts.chain_closest is None
+                              else f"{contacts.chain_closest:.2f}"),
             "status": status,
         }
         _log(f"[score] {sequence_id}: rmsd={fit.rmsd:.3f} "
              f"matched={fit.matched_pairs}/{fit.total_pairs} "
              f"({fit.matched_fraction:.1%})"
              + (f" site={site_value:.3f} over {site_count}" if site_value is not None else "")
+             + (f" on-fibre={contacts.contacting}/{contacts.measured} "
+                f"({contacts.fraction:.0%}) closest={contacts.chain_closest:.1f}A"
+                if contacts is not None and contacts.chain_closest is not None else "")
              + f" -> {status}")
 
         outcome = "passed" if passed else "rejected"
         members = pending.setdefault((outcome, group_key), [])
         collect_job(stage, job_name, protein_id, members)
+
+    # The reference complex travels with the passed folds. Stage 05 superposes
+    # each fold onto its two protein chains and takes its fibril -- the ligand
+    # AF3 predicted is discarded, because the fibre's geometry is the design's,
+    # not the prediction's. Sending it here means stage 05 never has to reach
+    # back into stage 04's inputs, which cleanup empties.
+    for (outcome, group_key), members in sorted(pending.items()):
+        if outcome != "passed" or not members:
+            continue
+        for protein_id in sorted({info.name.split("/")[0] for info, _ in members}):
+            name = f"{protein_id}/{protein_id}.pdb"
+            if not any(info.name == name for info, _ in members):
+                try:
+                    payload = reference_text(
+                        stage, experiment, group_key, protein_id).encode("utf-8")
+                except ScoreError as exc:
+                    _log(f"[sort] {protein_id}: reference not carried ({exc})")
+                    continue
+                info = tarfile.TarInfo(name)
+                info.size = len(payload)
+                members.append((info, payload))
+
+            # The redesign spec goes too: it names the scaffolded residues, and
+            # stage 05 superposes on exactly those.
+            spec_name = f"{protein_id}/{protein_id}_redesign.json"
+            if not any(info.name == spec_name for info, _ in members):
+                payload = passthrough_member(stage, experiment, group_key, spec_name)
+                if payload is not None:
+                    info = tarfile.TarInfo(spec_name)
+                    info.size = len(payload)
+                    members.append((info, payload))
 
     for (outcome, group_key), members in sorted(pending.items()):
         if not members:
@@ -556,18 +796,65 @@ def collect_job(stage: Path, job_name: str, protein_id: str,
 
 def run_scoring(stage: Path, experiment: Optional[str] = None,
                 rmsd_threshold: float = RMSD_THRESHOLD,
-                fraction_threshold: float = FRACTION_THRESHOLD) -> ScoreReport:
+                fraction_threshold: float = FRACTION_THRESHOLD,
+                min_site_contact: float = MIN_SITE_CONTACT) -> ScoreReport:
     report = ScoreReport()
     names = [experiment] if experiment else jp.inputs_experiments(stage)
     if not names:
         _log(f"[score] nothing handed over under {jp.inputs_root(stage)}")
         return report
     for experiment_name in names:
-        score_experiment(stage, experiment_name, report, rmsd_threshold, fraction_threshold)
+        score_experiment(stage, experiment_name, report, rmsd_threshold,
+                         fraction_threshold, min_site_contact)
     if report.no_site:
         _log(f"[score] {report.no_site} sequence(s) have no site_rmsd: stage 01 recorded "
              f"no fixed residues for them, so there was nothing to measure")
+    # Said every run, not only when it bites: a gate silently set to zero looks
+    # exactly like a gate that nothing failed.
+    if report.evaluated:
+        if min_site_contact > 0:
+            _log(f"[score] site contact gate at {min_site_contact:.0%} within "
+                 f"{SITE_CONTACT_CUTOFF:.1f} A: {report.off_fibre} rejected on it")
+        else:
+            _log(f"[score] site contact RECORDED but NOT gated (--min-site-contact 0). "
+                 f"The site_contacts / site_contact_fraction / chain_closest columns "
+                 f"are filled in; run site_contacts.py to choose a threshold.")
     return report
+
+
+def test_gate() -> None:
+    """Every branch of the pass decision, including the ones that cost GPU time.
+
+    Written because each of these has a way of being wrong that looks like
+    success: a gate left at zero looks like a gate nothing failed, a gate set
+    above what the seeds support looks like a stage that ran and found nothing,
+    and an off-by-one on >= rejects exactly the folds that reproduce the design.
+    """
+    good = Contacts(contacting=8, measured=10, site_closest=3.1, chain_closest=2.8)
+    poor = Contacts(contacting=1, measured=10, site_closest=9.4, chain_closest=8.9)
+
+    # the fold is good and on the fibre
+    assert verdict(1.9, 0.95, good, 2.5, 0.8, 0.8)[0]
+    # the same fold, folded off the fibre: rejected on contacts alone
+    passed, on_fibre = verdict(1.9, 0.95, poor, 2.5, 0.8, 0.8)
+    assert not passed and not on_fibre
+    # with the gate off it passes again, which is what "record only" means
+    assert verdict(1.9, 0.95, poor, 2.5, 0.8, 0.0)[0]
+    # boundary: a prediction that matches the gate exactly is kept, not dropped
+    assert verdict(1.9, 0.95, good, 2.5, 0.8, 0.8)[0], "0.8 >= 0.8 must pass"
+    assert not verdict(1.9, 0.95, good, 2.5, 0.8, 0.81)[0]
+    # contacts unknown: judged on the rest rather than failed for a missing record
+    assert verdict(1.9, 0.95, None, 2.5, 0.8, 1.0)[0]
+    # the RMSD threshold still bites, and 2.5 is the threshold
+    assert not verdict(2.6, 0.95, good, 2.5, 0.8, 0.8)[0]
+    assert verdict(2.49, 0.95, good, 2.5, 0.8, 0.8)[0]
+    # and so does matched_fraction
+    assert not verdict(1.9, 0.5, good, 2.5, 0.8, 0.8)[0]
+
+    assert RMSD_THRESHOLD == 2.5, RMSD_THRESHOLD
+    assert SITE_CONTACT_CUTOFF == 6.0, SITE_CONTACT_CUTOFF
+    print(f"[self-test] rmsd < {RMSD_THRESHOLD}, matched > {FRACTION_THRESHOLD}, "
+          f"site contact within {SITE_CONTACT_CUTOFF} A; every branch ok")
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
@@ -578,13 +865,25 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--experiment", default=None)
     parser.add_argument("--max-rmsd", type=float, default=RMSD_THRESHOLD)
     parser.add_argument("--min-fraction", type=float, default=FRACTION_THRESHOLD)
+    parser.add_argument("--min-site-contact", type=float, default=MIN_SITE_CONTACT,
+                        help=f"reject a fold unless this fraction of the seed's "
+                             f"ALL-fixed residues is still within "
+                             f"{SITE_CONTACT_CUTOFF:.1f} A of the fibre "
+                             f"(default: {MIN_SITE_CONTACT}, meaning record only). "
+                             f"site_contacts.py measures what these seeds support")
+    parser.add_argument("--self-test", action="store_true",
+                        help="check the pass decision against its own branches "
+                             "and exit, touching nothing on disk")
     return parser.parse_args(argv)
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
+    if args.self_test:
+        test_gate()
+        return 0
     report = run_scoring(args.stage.resolve(), args.experiment,
-                         args.max_rmsd, args.min_fraction)
+                         args.max_rmsd, args.min_fraction, args.min_site_contact)
     _log(f"[done] {report.summary()}")
     for table in report.tables:
         _log(f"[done] results -> {table}")
@@ -593,3 +892,4 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

@@ -30,3 +30,45 @@ trial_runs/
 
 # Local checkpoint copy or symlink, machine-specific
 01_rfd3_symmetry_generation/checkpoints/
+
+# --- pipeline outputs (added 2026-09-28) ---
+# Everything the pipeline writes. Each stage regenerates these from the stage
+# before it, so they are outputs, not source -- and they run to gigabytes.
+inputs/
+inputs_prepared/
+outputs/
+outputs_raw/
+outputs_clean/
+sorted_raw/
+sorted_clean/
+job_runs/
+af3_runs/
+logs/
+tables/
+
+__pycache__/
+*.pyc
+*.egg-info/
+.ipynb_checkpoints/
+
+# Patch tarballs and one-off debugging tools
+*.tar.gz
+*.tar
+*.zip
+check_symmetry.py
+
+# Exploratory runs kept outside the pipeline's own stage folders
+trial_runs/
+
+# 16k production outputs: the committed subset stays tracked, the rest does not
+results/
+
+# LigandMPNN scratch. Working state, not source -- and nothing in the pipeline
+# writes it any more.
+.mpnn_staging/
+.mpnn_pending_count
+
+# Stage 06's linker lengths are set by hand, so they are configuration rather
+# than the generated output that **/json/ is meant to catch.
+!06_rfd3_linker_generation/json/
+!06_rfd3_linker_generation/json/**

@@ -83,8 +83,13 @@ def resolve_seed_path(stage: Path, raw_input: str, json_path_: Path) -> Optional
 # Step 3. Outputs.
  
  
+def raw_root(stage: Path) -> Path:
+    """Where a generating stage's untidied output lands, before archiving."""
+    return stage / "outputs_raw"
+
+
 def raw_dir(stage: Path, experiment: str, group_key: str) -> Path:
-    return stage / "outputs_raw" / experiment / group_key
+    return raw_root(stage) / experiment / group_key
  
  
 def raw_cif_path(stage: Path, experiment: str, group_key: str, name: str) -> Path:
@@ -272,6 +277,14 @@ def results_table_path(stage: Path, experiment: str) -> Path:
     return stage / TABLES_DIRNAME / f"stage_{stage_label(stage)}_results_{experiment}.csv"
 
 
+def passed_table_path(stage: Path, experiment: str) -> Path:
+    """Stage 08 only: the round's deliverable, one row per construct that
+    passed -- which construct, its unit sequence, and the linker holding the
+    two copies of that unit together. The results table beside it keeps every
+    measurement and every rejection; this one is the answer."""
+    return stage / TABLES_DIRNAME / f"stage_{stage_label(stage)}_passed_{experiment}.csv"
+
+
 def legacy_results_table_path(stage: Path) -> Path:
     """The single shared table the 16k production run wrote, before results
     were split per experiment. Read as a fallback so those structures are
@@ -326,7 +339,7 @@ def sorted_experiments(stage: Path) -> List[str]:
 # passed in, so these work whichever stage directory calls them.
 
 STAGE01_DIRNAME = "01_rfd3_symmetry_generation"
-STAGE03_DIRNAME = "03_protein_mpnn"
+STAGE03_DIRNAME = "03_ligandmpnn"
 INPUTS_DIRNAME = "inputs"
 
 
@@ -394,7 +407,7 @@ def stage04_archive_path(stage: Path, experiment: str, group_key: str) -> Path:
 
 
 def prepared_dir(stage: Path, experiment: str, group_key: str) -> Path:
-    """The backbones handed to ProteinMPNN for one group, ligand stripped.
+    """The complexes handed to LigandMPNN for one group, protein plus ligand.
 
     Kept per group rather than in one flat folder so provenance is structural:
     the old flat layout lost which experiment a structure came from and had to
@@ -413,6 +426,23 @@ def fixed_positions_path(stage: Path, experiment: str, group_key: str) -> Path:
     return mpnn_work_dir(stage, experiment, group_key) / "fixed_positions.jsonl"
 
 
+def tied_positions_path(stage: Path, experiment: str, group_key: str) -> Path:
+    """Stage 07 only: the positions of copy A tied to their twins in copy B.
+
+    RFD3 fuses the two copies into one chain, so the tie is same-chain --
+    position i of the first lobe to position i of the second -- and it is what
+    keeps the two units identical after the linker's shell is redesigned.
+    """
+    return mpnn_work_dir(stage, experiment, group_key) / "tied_positions.jsonl"
+
+
+def linker_spec_path(stage: Path, experiment: str, group_key: str) -> Path:
+    """What stage 07 found in each construct: the linker, its shell, and where
+    the two copies sit. Stage 08 reads the linker back out of it rather than
+    deriving it a second time."""
+    return mpnn_work_dir(stage, experiment, group_key) / "linker.jsonl"
+
+
 def bias_aa_path(stage: Path) -> Path:
     """Hand-chosen composition bias -- config, so it lives with the code and is
     committed, unlike everything else here."""
@@ -426,14 +456,24 @@ def mpnn_outputs_path(stage: Path, experiment: str, group_key: str) -> Path:
 
 # Step 9. Stage 04: AlphaFold3.
 
-def af3_job_name(sequence_id: str) -> str:
+LIGAND_SUFFIX = "ligand"
+# Only for reading archives from the pipeline that folded without a ligand.
+# Nothing writes it any more, and it is NOT the default: a call site that
+# forgot the suffix used to get "_monomer" and match nothing, which reads
+# exactly like an empty queue.
+MONOMER_SUFFIX = "monomer"
+
+
+def af3_job_name(sequence_id: str, suffix: str = LIGAND_SUFFIX) -> str:
     """The AF3 job name for a sequence.
 
-    Still carries the '_monomer' suffix although the dimer job is gone: the
-    16k production run's outputs are named this way, and dropping the suffix
-    would make every one of them look unfolded and re-queue days of GPU time.
+    Stage 04 still uses '_monomer' although its dimer job is gone: the 16k
+    production run's outputs are named that way, and dropping the suffix would
+    make every one of them look unfolded and re-queue days of GPU time. Stage 06
+    folds the same sequence again with the ligand, so it uses '_ligand' -- the
+    suffix is what keeps the two stages' outputs from colliding.
     """
-    return f"{sequence_id}_monomer"
+    return f"{sequence_id}_{suffix}"
 
 
 def af3_json_experiment_dir(stage: Path, experiment: str) -> Path:
@@ -445,8 +485,10 @@ def af3_json_dir(stage: Path, experiment: str, group_key: str) -> Path:
     return af3_json_experiment_dir(stage, experiment) / group_key
 
 
-def af3_json_path(stage: Path, experiment: str, group_key: str, sequence_id: str) -> Path:
-    return af3_json_dir(stage, experiment, group_key) / f"{af3_job_name(sequence_id)}.json"
+def af3_json_path(stage: Path, experiment: str, group_key: str, sequence_id: str,
+                  suffix: str = LIGAND_SUFFIX) -> Path:
+    return (af3_json_dir(stage, experiment, group_key)
+            / f"{af3_job_name(sequence_id, suffix)}.json")
 
 
 def af3_output_dir(stage: Path, job_name: str) -> Path:
@@ -471,9 +513,17 @@ def af3_run_dir(stage: Path, job_name: str) -> Path:
     return stage / "af3_runs" / job_name
 
 
-# Step 10. Stage 05: LigandMPNN interface redesign.
+# Step 10. Stage 05: alignment onto the seed sides, and the RFD3 inputs.
+#
+# Called 05_geometry_filtering until it stopped filtering. AlphaFold folds
+# slightly differently from the design, so a clash measured on its prediction
+# is partly AlphaFold's deviation rather than the design's geometry -- and the
+# question it was asking has already been answered where it is objective, at
+# stage 02, on the designed coordinates (zero protein-protein contacts under
+# 1.8 A, zero protein-ligand under 2.2 A). The numbers are still measured and
+# recorded here; nothing is rejected on them.
 
-STAGE05_DIRNAME = "05_ligandmpnn"
+STAGE05_DIRNAME = "05_ligand_alignment"
 
 
 def stage05_root(stage: Path) -> Path:
@@ -484,27 +534,21 @@ def stage05_archive_path(stage: Path, experiment: str, group_key: str) -> Path:
     return stage05_root(stage) / INPUTS_DIRNAME / experiment / f"{group_key}.tar.gz"
 
 
-def complex_dir(stage: Path, experiment: str, group_key: str) -> Path:
-    """The protein+ligand complexes handed to LigandMPNN, one pdb per sequence.
-
-    Built here rather than carried from stage 04: the AF3 prediction has no
-    ligand, and the ligand's placement only exists once the prediction has been
-    superposed onto the reference it was designed against.
-    """
-    return stage / "inputs_prepared" / experiment / group_key
+def alignment_table_path(stage: Path, experiment: str) -> Path:
+    """One row per pair built: the fit, and how close the copies came to each
+    other and to the fibril. A record, not a filter."""
+    return stage / TABLES_DIRNAME / f"stage_{stage_label(stage)}_alignment_{experiment}.csv"
 
 
-def complex_path(stage: Path, experiment: str, group_key: str, sequence_id: str) -> Path:
-    return complex_dir(stage, experiment, group_key) / f"{sequence_id}.pdb"
+def linker_span_table_path(stage: Path, experiment: str) -> Path:
+    """One row per orientation: how far the linker has to reach, and the fewest
+    residues that could do it."""
+    return stage / TABLES_DIRNAME / f"stage_{stage_label(stage)}_pairs_{experiment}.csv"
 
 
-def rejected_complex_dir(stage: Path, experiment: str, group_key: str) -> Path:
-    """Complexes the clash check turned away, kept for inspection."""
-    return stage / "inputs_rejected" / experiment / group_key
-
-
-def clash_table_path(stage: Path, experiment: str) -> Path:
-    return stage / TABLES_DIRNAME / f"stage_{stage_label(stage)}_clashes_{experiment}.csv"
+# Step 10b. Stage 03's working paths, and the AF3 runner every folding stage
+# shares. These sit here because that is where they have always been; they were
+# briefly deleted along with a neighbouring block and are restored verbatim.
 
 
 def ligand_work_dir(stage: Path, experiment: str, group_key: str) -> Path:
@@ -514,19 +558,25 @@ def ligand_work_dir(stage: Path, experiment: str, group_key: str) -> Path:
 def redesign_spec_path(stage: Path, experiment: str, group_key: str) -> Path:
     """Which residues LigandMPNN may change, and which are tied to which.
 
-    One file per group holding a record per sequence, because the 8 A shell is
-    a property of the individual complex, not of the group.
+    One file per group holding a record per structure, because the redesignable
+    set is a property of the individual backbone, not of the group.
     """
     return ligand_work_dir(stage, experiment, group_key) / "redesign.jsonl"
 
 
-def ligand_outputs_path(stage: Path, experiment: str, group_key: str) -> Path:
-    return stage / "outputs" / experiment / f"{group_key}.tar.gz"
+def af3_shared_script(name: str) -> Path:
+    """One AF3 runner script, shared by every stage that folds.
+
+    Both stages invoke it the same way -- (json, stage root) in, a consolidated
+    <stage>/outputs/<job_name>/ out -- so a second copy would only be a second
+    thing to keep in step.
+    """
+    return Path(__file__).resolve().parent / "af3" / name
 
 
 # Step 11. Stage 06: RFD3 linker generation.
 
-STAGE06_DIRNAME = "06_rfd3_linker"
+STAGE06_DIRNAME = "06_rfd3_linker_generation"
 
 
 def stage06_root(stage: Path) -> Path:
@@ -535,4 +585,102 @@ def stage06_root(stage: Path) -> Path:
 
 def stage06_archive_path(stage: Path, experiment: str, group_key: str) -> Path:
     return stage06_root(stage) / INPUTS_DIRNAME / experiment / f"{group_key}.tar.gz"
+
+
+def pair_dir(stage: Path, experiment: str, group_key: str) -> Path:
+    """Where a stage keeps its per-sequence structures.
+
+    ONE file per sequence: <sid>.pdb, the two aligned copies with no cellulose.
+    Stage 06 unpacks the handover into the same relative path, so the "input"
+    field of a json written in stage 05 resolves unchanged when RFD3 reads it
+    in stage 06.
+    """
+    return stage / "inputs_prepared" / experiment / group_key
+
+
+def pair_path(stage: Path, experiment: str, group_key: str, sequence_id: str) -> Path:
+    """The aligned pair: two copies of one fold on the seed sides, cellulose
+    removed.
+
+    Both fibres are gone by the time this is written -- the one AlphaFold
+    predicted, which was its own guess, and the one from the reference that the
+    superposition was measured against. Neither is kept: the linker is generated
+    on protein alone, and a fibre that has to come back later is regenerable by
+    re-running this stage from its own input archives, which still hold the
+    reference complexes.
+    """
+    return pair_dir(stage, experiment, group_key) / f"{sequence_id}.pdb"
+
+
+def linker_json_dir(stage: Path, experiment: str) -> Path:
+    """The RFD3 jsons whose linker length you fill in. Written by stage 05,
+    unpacked to the same place by stage 06.
+
+    Flat, exactly like stage 01's json/<experiment>/, so the RFD3 runner there
+    drives these without adaptation: json_rel is a bare filename and
+    group_key_from_json_rel() gives a key with no path separator in it.
+    """
+    return experiment_json_dir(stage, experiment)
+
+
+# Step 12. Stage 07: ProteinMPNN on the linker.
+
+STAGE07_DIRNAME = "07_proteinmpnn_linker"
+
+
+def stage07_root(stage: Path) -> Path:
+    return project_root(stage) / STAGE07_DIRNAME
+
+
+def stage07_archive_path(stage: Path, experiment: str, group_key: str) -> Path:
+    return stage07_root(stage) / INPUTS_DIRNAME / experiment / f"{group_key}.tar.gz"
+
+
+# Step 13. Stage 08: AlphaFold3 on the finished construct.
+
+STAGE08_DIRNAME = "08_alphafold_construct"
+
+# The two folds stage 08 makes of every design. Both are monomers; what differs
+# is whether the fibril is in the box.
+# One fold, with the fibril. There were two for a while -- holo and apo, on the
+# argument that a construct folding only in the fibre's presence is leaning on
+# it -- but the question this stage asks is whether the linked construct still
+# binds cellulose, and the apo fold answered a different one at twice the GPU.
+HOLO_SUFFIX = "holo"    # with the fibril
+FOLD_SUFFIXES = (HOLO_SUFFIX,)
+
+
+def construct_pair_path(stage: Path, experiment: str, group_key: str,
+                        sequence_id: str) -> Path:
+    """The two copies as they stood BEFORE the linker was generated.
+
+    Stage 06 keeps these -- its jsons name them by absolute path, so nothing
+    deletes them -- which makes them the stable record of what the construct is
+    supposed to superpose back onto. Reaching for stage 05's copy instead would
+    break the moment that stage is cleaned.
+    """
+    return (stage06_root(stage) / "inputs_prepared" / experiment / group_key
+            / f"{sequence_id}.pdb")
+
+
+def sequence_id_from_design(design_name: str) -> str:
+    """'p001_AB_000001' -> 'p001'. The pair a generated construct came from.
+
+    Two things come off: the seed index job_name() appended, and the
+    orientation linker_jsons.py appended before that. Neither is guessable from
+    the sequence id itself, which contains underscores of its own.
+    """
+    group_key = group_key_from_job_name(design_name)
+    for orientation in ("_AB", "_BA"):
+        if group_key.endswith(orientation):
+            return group_key[: -len(orientation)]
+    return group_key
+
+
+def stage08_root(stage: Path) -> Path:
+    return project_root(stage) / STAGE08_DIRNAME
+
+
+def stage08_archive_path(stage: Path, experiment: str, group_key: str) -> Path:
+    return stage08_root(stage) / INPUTS_DIRNAME / experiment / f"{group_key}.tar.gz"
 

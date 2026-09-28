@@ -272,4 +272,3 @@ def save_table(
         writer.writeheader()
         for row in rows:
             writer.writerow({field: row.get(field, "") for field in fields})
-

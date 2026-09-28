@@ -54,6 +54,12 @@ STAGE = Path(__file__).resolve().parents[2]  # scripts/helping_scripts/../.. -> 
 ENV_FILE_REL = Path("scripts") / "env" / "rfd3.env"
 OVERLAY_REL = Path("overlay") / "rfd3_t3_overlay"
 
+# This stage's overrides. They are the DEFAULT rather than the only option:
+# stage 06 drives the same runner to generate linkers, which are not symmetric,
+# and passing kind=symmetry on a json that declares no symmetry makes RFD3 stop
+# with "Symmetry transform not found". Whatever a caller passes replaces this
+# list wholesale; nothing merges, so a caller cannot inherit a symmetry setting
+# it did not ask for.
 RFD3_SAMPLER_OVERRIDES: Tuple[str, ...] = (
     "diffusion_batch_size=1",
     "n_batches=1",
@@ -343,7 +349,9 @@ def _check_translations_env(
     _log(f"[symmetry] {label}: {symmetry_id} -> {env_name}={value}")
 
 
-def _invoke_rfd3(stage: Path, env: Rfd3Env, overlay_root: Path, json_path: Path, work_dir: Path) -> None:
+def _invoke_rfd3(stage: Path, env: Rfd3Env, overlay_root: Path, json_path: Path,
+                 work_dir: Path,
+                 sampler_overrides: Sequence[str] = RFD3_SAMPLER_OVERRIDES) -> None:
     shutil.rmtree(work_dir, ignore_errors=True)
     work_dir.mkdir(parents=True, exist_ok=True)
 
@@ -362,7 +370,7 @@ def _invoke_rfd3(stage: Path, env: Rfd3Env, overlay_root: Path, json_path: Path,
         f"inputs={rfd3_json}",
         f"out_dir={work_dir}",
         f"ckpt_path={env.ckpt}",
-        *RFD3_SAMPLER_OVERRIDES,
+        *sampler_overrides,
     ]
     _log("$ " + " ".join(shlex.quote(part) for part in cmd))
     # cwd is pinned to the stage root so a relative 'input' path in a json
@@ -606,7 +614,8 @@ def _record_fixed_residues(
 
 
 def run_one_job(
-    experiment: str, json_rel: str, global_seq: int, stage: Path = STAGE
+    experiment: str, json_rel: str, global_seq: int, stage: Path = STAGE,
+    sampler_overrides: Sequence[str] = RFD3_SAMPLER_OVERRIDES,
 ) -> JobResult:
     json_path = jp.json_path(stage, experiment, json_rel)
     group_key = jp.group_key_from_json_rel(json_rel)
@@ -640,7 +649,8 @@ def run_one_job(
         env = _resolve_rfd3_env(env_file)
 
         _log("===== RUN RFD3 =====")
-        _invoke_rfd3(stage, env, overlay_root, json_path, work_dir)
+        _invoke_rfd3(stage, env, overlay_root, json_path, work_dir,
+                     sampler_overrides)
 
         _log()
         _log("===== LOCATE OUTPUT FILES =====")
@@ -694,4 +704,3 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

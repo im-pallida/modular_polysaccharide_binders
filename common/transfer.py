@@ -153,11 +153,22 @@ def _read_new_members(
                 continue
             for member_name in names:
                 member_info = source.getmember(member_name)
+                if member_info.isdir():
+                    # Directory entries carry no data. An archive written by a
+                    # stage has none, but one made by hand with `tar czf` does,
+                    # and they must not look like unreadable files.
+                    continue
                 extracted = source.extractfile(member_info)
                 if extracted is None:
                     raise TransferError(
                         f"could not read member {member_name!r} from {source_path}"
                     )
+                # Normalise the './' that `tar czf ... -C dir .` writes, so the
+                # destination holds plain names. Archive verification compares
+                # normalised names, so carrying the prefix through would make a
+                # correctly written archive fail its own check.
+                if member_info.name.startswith("./"):
+                    member_info.name = member_info.name[2:]
                 members.append((member_info, extracted.read()))
 
     return members, incomplete, skipped
@@ -237,4 +248,3 @@ def cli(destination_for: DestinationFor, label: str, default_stage: Path,
         return 2
     _log(f"[done] {report.summary()}")
     return 0 if report.ok else 1
-

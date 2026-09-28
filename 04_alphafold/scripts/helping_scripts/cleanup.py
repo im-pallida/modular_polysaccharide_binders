@@ -2,8 +2,8 @@
 """
 Stage 04, last step: delete what the archives already hold.
 
-    outputs/<sequence_id>_monomer/                  <- removed
-    af3_runs/<sequence_id>_monomer/                 <- removed
+    outputs/<sequence_id>_ligand/                   <- removed
+    af3_runs/<sequence_id>_ligand/                  <- removed
     job_runs/af3/<experiment>/<group>/<job>.json    <- removed
 
 Nothing is deleted on the strength of the results table alone. A sequence is
@@ -67,15 +67,19 @@ class CleanReport:
         return ", ".join(parts)
 
 
-def archived_jobs(stage: Path, experiment: str) -> Set[str]:
+def archived_jobs(stage: Path, experiment: str,
+                  suffix: str = jp.LIGAND_SUFFIX) -> Set[str]:
     """Job names whose files are actually inside a sorted_clean archive.
 
     Read from the archives themselves rather than inferred from the table, so a
     table written before an archive was updated cannot authorise a deletion.
     """
     found: Set[str] = set()
-    for outcome in jp.OUTCOMES:
-        directory = jp.sorted_clean_dir(stage, experiment, outcome)
+    directories = [jp.sorted_clean_dir(stage, experiment, outcome)
+                   for outcome in jp.OUTCOMES]
+    # A stage with no pass/fail split archives straight into outputs_clean/.
+    directories.append(jp.clean_dir(stage, experiment))
+    for directory in directories:
         if not directory.is_dir():
             continue
         for archive_path in sorted(directory.glob("*.tar.gz")):
@@ -83,7 +87,7 @@ def archived_jobs(stage: Path, experiment: str) -> Set[str]:
                 for name in archive.getnames():
                     parts = (name[2:] if name.startswith("./") else name).split("/")
                     # <protein_id>/<sequence_id>_monomer/...
-                    if len(parts) > 2 and parts[1].endswith("_monomer"):
+                    if len(parts) > 2 and parts[1].endswith(f"_{suffix}"):
                         found.add(parts[1])
     return found
 
@@ -100,16 +104,17 @@ def clean_experiment(stage: Path, experiment: str, report: CleanReport,
                      dry_run: bool) -> None:
     table = jp.results_table_path(stage, experiment)
     scored: Dict[str, dict] = load_table(table, key="sequence_id")
+    suffix = jp.LIGAND_SUFFIX
     if not scored:
         _log(f"[clean] {experiment}: nothing scored yet, nothing to clear")
         return
 
-    archived = archived_jobs(stage, experiment)
+    archived = archived_jobs(stage, experiment, suffix)
     _log(f"[clean] {experiment}: {len(scored)} scored, "
          f"{len(archived)} present in sorted_clean archives")
 
     for sequence_id, row in sorted(scored.items()):
-        job_name = jp.af3_job_name(sequence_id)
+        job_name = jp.af3_job_name(sequence_id, suffix)
         if job_name not in archived:
             report.kept_unarchived += 1
             continue
@@ -121,7 +126,7 @@ def clean_experiment(stage: Path, experiment: str, report: CleanReport,
         ]
         if group_key:
             targets.append(
-                jp.af3_json_path(stage, experiment, group_key, sequence_id)
+                jp.af3_json_path(stage, experiment, group_key, sequence_id, suffix)
             )
         present = [path for path in targets if path.exists()]
         if not present:
@@ -148,8 +153,9 @@ def clean_experiment(stage: Path, experiment: str, report: CleanReport,
             if not job_dir.is_dir():
                 continue
             name = job_dir.name
-            sequence_id = (name[: -len("_monomer")]
-                           if name.endswith("_monomer") else name)
+            ending = f"_{suffix}"
+            sequence_id = (name[: -len(ending)]
+                           if name.endswith(ending) else name)
             if sequence_id not in scored:
                 report.kept_unscored += 1
 
@@ -180,7 +186,8 @@ def run_cleanup(stage: Path, experiment: Optional[str] = None,
         clean_experiment(stage, experiment_name, report, dry_run)
     emptied = remove_empty_dirs(stage, dry_run)
     if emptied:
-        _log(f"[clean] {emptied} empty director{'y' if emptied == 1 else 'ies'} removed")
+        _log(f"[clean] {emptied} empty director{'y' if emptied == 1 else 'ies'} "
+             f"{'would be removed' if dry_run else 'removed'}")
     return report
 
 
@@ -204,4 +211,3 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
