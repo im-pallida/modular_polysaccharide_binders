@@ -52,13 +52,27 @@ find_produced() {
     return 1
 }
 
-AF3_ROOT="${AF3_ROOT:-/home/karina/software/alphafold3}"
+# Machine settings: whatever the caller exported wins, then site.local.env,
+# then discovery. No username appears anywhere below.
+_COMMON="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)"
+if [ -f "$_COMMON/site.env" ]; then . "$_COMMON/site.env"; fi
+AF3_ROOT="${AF3_ROOT:-}"
+if [ -z "$AF3_ROOT" ]; then
+    echo "ERROR: AF3_ROOT is not set and was not found." >&2
+    echo "       run: python3 \"$_COMMON/check_site.py\"" >&2
+    exit 1
+fi
 if [ ! -f "$AF3_ROOT/run_alphafold.py" ]; then
     echo "ERROR: run_alphafold.py not found at $AF3_ROOT/run_alphafold.py" >&2
     echo "       set AF3_ROOT to the alphafold3 checkout" >&2
     exit 1
 fi
-MODEL_DIR="${MODEL_DIR:-/home/fabioadmin/software/alphafold3_model_params}"
+MODEL_DIR="${MODEL_DIR:-}"
+if [ -z "$MODEL_DIR" ]; then
+    echo "ERROR: MODEL_DIR is not set and was not found." >&2
+    echo "       run: python3 \"$_COMMON/check_site.py\"" >&2
+    exit 1
+fi
 if [ ! -d "$MODEL_DIR" ]; then
     echo "ERROR: model parameters not found at $MODEL_DIR -- set MODEL_DIR" >&2
     exit 1

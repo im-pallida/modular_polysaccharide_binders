@@ -68,15 +68,72 @@ def design_entries(data: object) -> "dict[str, dict]":
     return dict(data)
  
  
+REFERENCE_DIRNAME = "00_reference_structures"
+
+
 def resolve_seed_path(stage: Path, raw_input: str, json_path_: Path) -> Optional[Path]:
-    """Locate the seed structure a json's "input" field points at."""
+    """Locate the seed structure a json's "input" field points at.
+
+    An absolute path is honoured when it exists, and a relative one is resolved
+    against the stage and then the json's own folder -- both as before.
+
+    What is new is the last resort. Design jsons are configuration and are
+    committed, but their "input" was written on whichever machine created them,
+    so a json made on the cluster carries /scratch/<project>/<someone>/... and
+    is useless on a workstation, and the reverse. The seed itself is sitting in
+    this checkout the whole time, under 00_reference_structures, so the file is
+    looked for there by name before giving up.
+
+    That makes one committed json serve both machines, and it is why a cluster
+    whose scratch is reachable as both /scratch and /shared/scratch stops
+    mattering.
+    """
     candidate = Path(raw_input)
+    project = stage.parent
     if candidate.is_absolute():
-        return candidate if candidate.is_file() else None
-    for base in (stage, json_path_.parent):
-        resolved = (base / candidate).resolve()
-        if resolved.is_file():
-            return resolved
+        if candidate.is_file():
+            return candidate
+        # Written by another checkout of this same project. Rebuild it onto
+        # this one: find the first component of the stored path that names a
+        # directory here -- '06_rfd3_linker_generation', say -- and keep
+        # everything from there on.
+        #
+        #   stored  /home/karina/1cbh_clear/06_.../inputs_prepared/e/g/x.pdb
+        #   here    /shared/scratch/SCWF00146/karina/1cbh_clear
+        #   found   <here>/06_.../inputs_prepared/e/g/x.pdb
+        #
+        # Left to right, so the longest tail wins and the most specific match
+        # is the one taken. This is what lets a json written on the workstation
+        # run on the cluster without being regenerated -- and stage 06's linker
+        # lengths are set by hand, so regenerating is not a free operation.
+        rebuilt = _reanchor(project, candidate)
+        if rebuilt is not None:
+            return rebuilt
+    else:
+        # project first: a path stored relative to the checkout root, which is
+        # what a stage writing into ANOTHER stage's tree has to use.
+        for base in (project, stage, json_path_.parent):
+            resolved = (base / candidate).resolve()
+            if resolved.is_file():
+                return resolved
+
+    reference = project / REFERENCE_DIRNAME
+    if candidate.name and reference.is_dir():
+        for match in sorted(reference.rglob(candidate.name)):
+            if match.is_file():
+                return match
+    return None
+
+
+def _reanchor(project: Path, candidate: Path) -> Optional[Path]:
+    """An absolute path from another checkout, rebuilt onto this project."""
+    parts = candidate.parts
+    for index in range(len(parts) - 1):
+        if not (project / parts[index]).is_dir():
+            continue
+        rebuilt = project.joinpath(*parts[index:])
+        if rebuilt.is_file():
+            return rebuilt
     return None
  
  

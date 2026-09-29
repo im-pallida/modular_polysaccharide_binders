@@ -78,6 +78,39 @@ def extract_member(archive: tarfile.TarFile, member_name: str, extract_dir: Path
     return extract_dir / member_name
 
 
+def archived_stems(archive_path: Path, suffix: str = "") -> "set":
+    """Member basenames inside an archive, with `suffix` stripped.
+
+    The evidence a cleanup is allowed to delete on. A row in a results table is
+    a claim and a file on disk is a coincidence; a member in the tarball is the
+    structure itself. Every cleanup in this pipeline opens the archive and
+    checks the names, every time, and this is the one implementation of that.
+
+    A missing or unreadable archive yields nothing, so the caller deletes
+    nothing -- which is the right way round for a function whose answer
+    authorises deletion.
+    """
+    found = set()
+    if not archive_path.is_file():
+        return found
+    try:
+        with tarfile.open(archive_path, "r:gz") as archive:
+            names = archive.getnames()
+    except (tarfile.TarError, OSError):
+        return found
+    for name in names:
+        cleaned = name[2:] if name.startswith("./") else name
+        base = cleaned.rsplit("/", 1)[-1]
+        if not base:
+            continue
+        if suffix:
+            if base.endswith(suffix):
+                found.add(base[: -len(suffix)])
+        else:
+            found.add(base)
+    return found
+
+
 def read_archive_members(archive_path: Path) -> List[Tuple[tarfile.TarInfo, bytes]]:
     """Every regular file in an archive, as (info, bytes)."""
     members: List[Tuple[tarfile.TarInfo, bytes]] = []

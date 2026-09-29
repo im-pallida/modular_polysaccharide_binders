@@ -1,0 +1,21 @@
+# What the PIPELINE'S OWN interpreter needs -- the one the launchers re-exec
+# into, which on a cluster is usually a plain venv beside the checkout:
+#
+#     <venv>/bin/pip install -r common/requirements.txt
+#
+# That is the whole environment. LigandMPNN's torch, ProteinMPNN's, RFD3's and
+# AlphaFold3's are NOT here: each of those lives in its own install and is found
+# through common/site_config.py, so the pipeline never has to share an
+# environment with any of them.
+#
+# Unpinned on purpose. A workstation gets these from conda and a cluster from
+# pip, and a pin that suits one fights the other. python3 common/check_site.py
+# reports which are missing and which interpreter is missing them.
+#
+# This file exists because these three were discovered one stage failure at a
+# time -- gemmi at stage 01, biopython only at stage 04, after the folding had
+# already been set up. A machine should be one command away from ready.
+
+gemmi
+numpy
+biopython

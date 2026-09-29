@@ -26,7 +26,6 @@ output already exists is skipped.
 from __future__ import annotations
 
 import argparse
-import shutil
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -36,6 +35,8 @@ from typing import List, Optional, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "common"))
 import job_paths as jp  # noqa: E402
+import partitions  # noqa: E402
+import site_config as site  # noqa: E402
 from archives import load_table  # noqa: E402
 
 SBATCH_SCRIPT = jp.af3_shared_script("run_af3_one.sbatch")
@@ -114,6 +115,7 @@ def run_one(stage: Path, job_name: str, json_path: Path,
     if cluster:
         command = [
             "sbatch", "--wait",
+            *partitions.sbatch_args(),
             "--job-name", job_name,
             "--chdir", str(stage),
             "--output", str(logs / f"{job_name}-%j.out"),
@@ -166,7 +168,7 @@ def run_af3(stage: Path, experiment: Optional[str] = None,
             max_concurrent: int = MAX_CONCURRENT,
             suffix: str = jp.LIGAND_SUFFIX) -> RunReport:
     report = RunReport()
-    cluster = shutil.which("sbatch") is not None
+    cluster = site.mode() == "cluster"
     script = SBATCH_SCRIPT if cluster else WS_SCRIPT
     if not script.is_file():
         raise Af3Error(f"missing runner script: {script}")

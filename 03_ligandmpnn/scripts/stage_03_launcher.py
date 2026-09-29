@@ -28,7 +28,6 @@ run.py), and LIGANDMPNN_CHECKPOINT if the weights are not at the default path.
 from __future__ import annotations
 
 import argparse
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -42,7 +41,19 @@ COMMON_DIR = STAGE_ROOT.parent / "common"
 sys.path.insert(0, str(COMMON_DIR))
 sys.path.insert(0, str(HELPING_SCRIPTS_DIR))
 
+# Before importing anything that needs gemmi: if this interpreter cannot, start
+# again under one that can. A no-op wherever the environment is already right,
+# which is every workstation run.
+import bootstrap  # noqa: E402
+
+try:
+    bootstrap.ensure()
+except bootstrap.BootstrapError as _exc:
+    raise SystemExit(f"ERROR: {_exc}")
+
 import job_paths as jp  # noqa: E402
+import partitions  # noqa: E402
+import site_config as site  # noqa: E402
 from ligand_prepare import PrepareError, prepare_group  # noqa: E402
 from run_ligandmpnn import (  # noqa: E402
     LigandMpnnError,
@@ -75,15 +86,18 @@ def outstanding_groups(stage: Path, experiment: Optional[str]) -> List[Tuple[str
 
 def dispatch_group(stage: Path, experiment: str, group_key: str) -> bool:
     """Design one group: sbatch where it exists, in place otherwise."""
-    if shutil.which("sbatch") is not None:
+    if site.mode() == "cluster":
         logs = stage / "logs" / experiment
         logs.mkdir(parents=True, exist_ok=True)
         command = [
             "sbatch", "--wait",
+            *partitions.sbatch_args(),
             "--chdir", str(stage),
             "--output", str(logs / f"{group_key}-%j.out"),
             "--error", str(logs / f"{group_key}-%j.err"),
-            str(SBATCH_SCRIPT), experiment, group_key,
+            # The stage goes on the command line: a submitted batch script
+            # runs from SLURM's spool, not from the checkout.
+            str(SBATCH_SCRIPT), experiment, group_key, str(stage),
         ]
         _log("$ " + " ".join(command))
         return subprocess.run(command).returncode == 0
@@ -107,7 +121,7 @@ def design_structures(stage: Path, experiment: Optional[str]) -> bool:
         _log(f"[ligandmpnn] nothing to design under {jp.inputs_root(stage)}")
         return True
 
-    mode = "cluster" if shutil.which("sbatch") else "workstation"
+    mode = site.mode()
     _log(f"[ligandmpnn] {len(groups)} group(s), mode={mode}, one job per group")
     ok = True
     for experiment_name, group_key in groups:
@@ -173,11 +187,28 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                         help="keep job_runs/ and inputs_prepared/")
     parser.add_argument("--clean-dry-run", action="store_true",
                         help="report what cleanup would remove, remove nothing")
+    parser.add_argument("--partition", default=None,
+                        help="submit to this Slurm partition instead of asking "
+                             "(cluster only; PIPELINE_PARTITION does the same)")
     return parser.parse_args(argv)
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
+    # Fill in whatever this machine has not exported -- tool locations, and
+    # whether there is a queue. Anything already exported is left alone.
+    try:
+        site.apply()
+    except site.SiteError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    # Asked once, here, before anything submits or any thread pool starts.
+    if site.mode() == "cluster":
+        try:
+            partitions.choose(args.partition)
+        except partitions.PartitionError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 2
     stage = args.stage.resolve()
 
     designed_ok = True

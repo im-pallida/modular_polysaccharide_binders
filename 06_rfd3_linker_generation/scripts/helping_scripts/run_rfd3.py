@@ -40,8 +40,12 @@ from typing import List, Optional, Sequence, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "common"))
 import job_paths as jp  # noqa: E402
+import partitions  # noqa: E402
+import rfd3_dispatch  # noqa: E402
+import site_config as site  # noqa: E402
 
 STAGE = Path(__file__).resolve().parents[2]
+SCRIPT_DIR = Path(__file__).resolve().parent
 
 LINKER_TOKEN = "LINKER"
 DIFFUSED = re.compile(r"^\d+(?:-\d+)?$")
@@ -166,17 +170,27 @@ def input_problem(stage: Path, path: Path) -> Optional[str]:
         return "has no input path"
     if jp.resolve_seed_path(stage, raw, path) is not None:
         return None
+    # A path from another machine is NOT this error any more -- resolve_seed_path
+    # re-anchors one onto this checkout. So by the time this fires, the pdb is
+    # genuinely absent from this project, and the remedy is to lay it out rather
+    # than to regenerate the json. Saying "delete the jsons and re-run stage 05",
+    # which this used to, would throw away linker lengths set by hand.
+    expected = (jp.pair_dir(stage, "<experiment>", "<group>") / Path(raw).name)
     return (f"its input pdb is not there: {raw}\n"
-            f"        Stage 05 wrote that path pointing into this stage, and "
-            f"stage 06 lays the pdbs out from the handover archive. Run the "
-            f"launcher, which unpacks before generating, or unpack_inputs.py "
-            f"on its own. If the project has been moved since stage 05 ran, the "
-            f"absolute paths in the jsons are stale and stage 05 must rewrite "
-            f"them: delete the jsons and re-run it.")
+            f"        Nothing in this checkout matches it either, so the pdb has "
+            f"not been laid out yet. Stage 06 unpacks it from the handover "
+            f"archive:\n"
+            f"            {SCRIPT_DIR / 'unpack_inputs.py'}\n"
+            f"        or just run the launcher, which unpacks before it "
+            f"generates. It belongs at\n"
+            f"            {expected}\n"
+            f"        Leave the json alone -- its linker length is yours, and "
+            f"a path written on another machine is re-anchored automatically.")
 
 
-def ready_jsons(stage: Path, experiment: str,
-                report: RunReport) -> List[Tuple[str, Path]]:
+def ready_jsons(stage: Path, experiment: str, report: RunReport,
+                sequence_id: Optional[str] = None,
+                orientation: Optional[str] = None) -> List[Tuple[str, Path]]:
     """(json_rel, path) for every json with a linker length.
 
     An unfilled one is recorded as a failure of that json and left out of the
@@ -188,6 +202,13 @@ def ready_jsons(stage: Path, experiment: str,
         return []
     ready: List[Tuple[str, Path]] = []
     for path in sorted(directory.glob("*.json")):
+        # Filtered before anything is judged, so a json you did not ask for is
+        # not reported as unfilled either. Same spellings as set_linker.py, so
+        # the flags that chose a length choose what to generate from it.
+        if sequence_id and not path.stem.startswith(sequence_id):
+            continue
+        if orientation and not path.stem.endswith(f"_{orientation}"):
+            continue
         filled, reason = is_filled(path)
         if not filled:
             report.unfilled.append(f"{experiment}/{path.name}: {reason}")
@@ -227,18 +248,22 @@ def archived_designs(stage: Path, experiment: str) -> set:
     return found
 
 
-def _runner():
-    """Stage 01's RFD3 job runner, imported so there is only one of it."""
+def runner_path() -> Path:
+    """Stage 01's RFD3 job runner: one file, used by both stages.
+
+    Returned as a path rather than an imported module because the cluster route
+    does not import it -- it runs it as a script on a compute node, and the
+    dispatcher needs somewhere to point the sbatch script at. On a workstation
+    the dispatcher imports the same path in-process.
+    """
     root = Path(__file__).resolve().parents[3] / jp.STAGE01_DIRNAME
-    helpers = root / "scripts" / "helping_scripts"
-    if not (helpers / "run_one_job.py").is_file():
+    runner = root / "scripts" / "helping_scripts" / "run_one_job.py"
+    if not runner.is_file():
         raise Rfd3Error(
-            f"stage 01's RFD3 runner is not at {helpers / 'run_one_job.py'}; "
-            f"stage 06 drives RFD3 through it rather than carrying its own copy"
+            f"stage 01's RFD3 runner is not at {runner}; stage 06 drives RFD3 "
+            f"through it rather than carrying its own copy"
         )
-    sys.path.insert(0, str(helpers))
-    import run_one_job  # noqa: E402
-    return run_one_job
+    return runner
 
 
 def check_env(stage: Path) -> None:
@@ -255,13 +280,44 @@ def check_env(stage: Path) -> None:
     )
 
 
+def build_rows(stage: Path, experiment: str, jobs: Sequence[Tuple[str, Path]],
+               designs: int, done: set, report: RunReport,
+               limit: Optional[int] = None) -> List[Tuple[str, int]]:
+    """(json_rel, seed) for everything still to generate.
+
+    Consecutive seeds, 1..designs. The runner names the output from the seed,
+    so a re-run with a larger --designs adds the new ones and leaves the
+    existing ones alone rather than regenerating them.
+
+    The run list holds ONLY outstanding work, which is why the dispatcher is
+    told which designs are already archived: it verifies every row afterwards,
+    and a row it cannot find on disk and cannot find in an archive is a
+    failure. Stage 06 archives into sorted_clean/<experiment>/passed/, not the
+    outputs_clean/ the dispatcher reads by default.
+    """
+    rows: List[Tuple[str, int]] = []
+    for json_rel, _ in jobs:
+        group_key = jp.group_key_from_json_rel(json_rel)
+        for seed in range(1, designs + 1):
+            if limit is not None and len(rows) >= limit:
+                _log(f"[rfd3] stopping at --limit {limit}")
+                return rows
+            if jp.job_name(group_key, seed) in done:
+                report.already += 1
+                continue
+            rows.append((json_rel, seed))
+    return rows
+
+
 def run_experiment(stage: Path, experiment: str, report: RunReport,
                    designs: int = DESIGNS_PER_JSON,
-                   overrides: Sequence[str] = RFD3_LINKER_OVERRIDES) -> None:
-    runner = _runner()
+                   overrides: Sequence[str] = RFD3_LINKER_OVERRIDES,
+                   sequence_id: Optional[str] = None,
+                   orientation: Optional[str] = None,
+                   limit: Optional[int] = None) -> None:
     check_env(stage)
 
-    jobs = ready_jsons(stage, experiment, report)
+    jobs = ready_jsons(stage, experiment, report, sequence_id, orientation)
     if not jobs:
         _log(f"[rfd3] {experiment}: nothing is ready to run")
         return
@@ -269,37 +325,32 @@ def run_experiment(stage: Path, experiment: str, report: RunReport,
     _log(f"[rfd3] sampler: {' '.join(overrides)}")
 
     done = archived_designs(stage, experiment)
+    rows = build_rows(stage, experiment, jobs, designs, done, report, limit)
+    if not rows:
+        _log(f"[rfd3] {experiment}: every design already exists ({report.already})")
+        return
 
-    for json_rel, path in jobs:
-        group_key = jp.group_key_from_json_rel(json_rel)
-        # Consecutive seeds, 1..designs. The runner names the output from the
-        # seed, so a re-run with a larger --designs adds the new ones and leaves
-        # the existing ones alone rather than regenerating them.
-        for seed in range(1, designs + 1):
-            if jp.job_name(group_key, seed) in done:
-                report.already += 1
-                continue
-            try:
-                result = runner.run_one_job(experiment, json_rel, seed,
-                                            stage, overrides)
-            except Exception as exc:                  # the runner raises its own
-                report.problems.append(f"{experiment}/{json_rel}#{seed}: {exc}")
-                _log(f"[rfd3] {json_rel} seed {seed}: FAILED ({exc})")
-                continue
-            status = getattr(result.status, "name", str(result.status))
-            if status == "SKIPPED":
-                report.already += 1
-            elif status == "FAILED":
-                report.failed.append(f"{json_rel}#{seed}: {result.message}")
-                _log(f"[rfd3] {json_rel} seed {seed}: FAILED ({result.message})")
-            else:
-                report.ran += 1
-                _log(f"[rfd3] {json_rel} seed {seed}: generated")
+    # Same run list, same dispatcher, same canary as stage 01 -- the only thing
+    # stage 06 supplies that stage 01 does not is its own sampler, which is the
+    # one thing that could not previously travel to a compute node.
+    run_list = jp.run_list_path(stage, experiment)
+    jp.write_run_list(run_list, rows)
+    _log(f"[rfd3] {len(rows)} job(s) queued in {run_list}")
+
+    dispatched = rfd3_dispatch.dispatch(experiment, run_list, stage,
+                                        runner_path(), overrides, done)
+    report.ran += len(rows) - len(dispatched.failed)
+    for json_rel, seed in dispatched.failed:
+        missing = jp.expected_raw_cif(stage, experiment, json_rel, seed)
+        report.failed.append(f"{json_rel}#{seed}: no structure at {missing}")
 
 
 def run_rfd3(stage: Path, experiment: Optional[str] = None,
              designs: int = DESIGNS_PER_JSON,
-             overrides: Sequence[str] = RFD3_LINKER_OVERRIDES) -> RunReport:
+             overrides: Sequence[str] = RFD3_LINKER_OVERRIDES,
+             sequence_id: Optional[str] = None,
+             orientation: Optional[str] = None,
+             limit: Optional[int] = None) -> RunReport:
     report = RunReport()
     root = jp.json_root(stage)
     if not root.is_dir():
@@ -309,7 +360,8 @@ def run_rfd3(stage: Path, experiment: Optional[str] = None,
         path.name for path in root.iterdir() if path.is_dir()
     )
     for experiment_name in names:
-        run_experiment(stage, experiment_name, report, designs, overrides)
+        run_experiment(stage, experiment_name, report, designs, overrides,
+                       sequence_id, orientation, limit)
     return report
 
 
@@ -322,11 +374,22 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--designs", type=int, default=DESIGNS_PER_JSON,
                         help=f"backbones per json, on consecutive seeds "
                              f"(default: {DESIGNS_PER_JSON})")
+    parser.add_argument("--sequence-id", default=None,
+                        help="only the jsons for this design")
+    parser.add_argument("--orientation", choices=("AB", "BA"), default=None,
+                        help="only one direction")
+    parser.add_argument("--limit", type=int, default=None, metavar="N",
+                        help="stop after N RFD3 invocations IN TOTAL. --designs is "
+                             "per json, so --designs 1 over 28 jsons is 28 jobs; "
+                             "--limit 1 is one job")
     parser.add_argument("--override", action="append", default=None, metavar="KEY=VALUE",
                         help="an extra RFD3 sampler override, repeatable. Added to "
                              "the linker defaults, which carry no symmetry settings")
     parser.add_argument("--list", action="store_true",
                         help="say which jsons are ready and which are not, run nothing")
+    parser.add_argument("--partition", default=None,
+                        help="submit to this Slurm partition instead of asking "
+                             "(cluster only; PIPELINE_PARTITION does the same)")
     return parser.parse_args(argv)
 
 
@@ -339,15 +402,26 @@ def main(argv: Optional[List[str]] = None) -> int:
             path.name for path in jp.json_root(stage).iterdir() if path.is_dir()
         ) if jp.json_root(stage).is_dir() else []
         for name in names:
-            ready = ready_jsons(stage, name, report)
+            ready = ready_jsons(stage, name, report,
+                                args.sequence_id, args.orientation)
             for json_rel, _ in ready:
                 _log(f"[rfd3] {json_rel}: ready")
         _log(f"[done] {len(names)} experiment(s), "
              f"{len(report.unfilled)} not ready")
         return 0
+    # This file can be run on its own, so it settles the machine itself rather
+    # than relying on the launcher having done it.
+    try:
+        site.apply()
+        if site.mode() == "cluster":
+            partitions.choose(args.partition)
+    except (site.SiteError, partitions.PartitionError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
     try:
         overrides = tuple(RFD3_LINKER_OVERRIDES) + tuple(args.override or ())
-        report = run_rfd3(stage, args.experiment, args.designs, overrides)
+        report = run_rfd3(stage, args.experiment, args.designs, overrides,
+                          args.sequence_id, args.orientation, args.limit)
     except Rfd3Error as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2

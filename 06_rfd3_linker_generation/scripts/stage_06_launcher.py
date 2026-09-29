@@ -41,7 +41,19 @@ COMMON_DIR = STAGE_ROOT.parent / "common"
 sys.path.insert(0, str(COMMON_DIR))
 sys.path.insert(0, str(HELPING_SCRIPTS_DIR))
 
+# Before importing anything that needs gemmi: if this interpreter cannot, start
+# again under one that can. A no-op wherever the environment is already right,
+# which is every workstation run.
+import bootstrap  # noqa: E402
+
+try:
+    bootstrap.ensure()
+except bootstrap.BootstrapError as _exc:
+    raise SystemExit(f"ERROR: {_exc}")
+
 import job_paths as jp  # noqa: E402
+import partitions  # noqa: E402
+import site_config as site  # noqa: E402
 from archive_designs import run_archive  # noqa: E402
 from cleanup import run_cleanup  # noqa: E402
 from transfer_to_stage07 import TransferError, run_transfer  # noqa: E402
@@ -60,14 +72,24 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--stage", type=Path, default=STAGE_ROOT)
     parser.add_argument("--experiment", default=None)
     parser.add_argument("--designs", type=int, default=DESIGNS_PER_JSON,
-                        help=f"backbones per json, on consecutive seeds "
-                             f"(default: {DESIGNS_PER_JSON})")
+                        help=f"backbones PER JSON, on consecutive seeds "
+                             f"(default: {DESIGNS_PER_JSON}). With 28 jsons, "
+                             f"--designs 1 is 28 jobs, not one -- use --limit for that")
+    parser.add_argument("--sequence-id", default=None,
+                        help="only the jsons for this design")
+    parser.add_argument("--orientation", choices=("AB", "BA"), default=None,
+                        help="only one direction")
+    parser.add_argument("--limit", type=int, default=None, metavar="N",
+                        help="stop after N RFD3 invocations in total")
     parser.add_argument("--no-generate", action="store_true",
                         help="lay the inputs out but do not run RFD3")
     parser.add_argument("--no-transfer", action="store_true",
                         help="do not hand anything to stage 07")
     parser.add_argument("--no-clean", action="store_true",
                         help="keep outputs_raw and the laid-out pdbs")
+    parser.add_argument("--partition", default=None,
+                        help="submit to this Slurm partition instead of asking "
+                             "(cluster only; PIPELINE_PARTITION does the same)")
     parser.add_argument("--clean-dry-run", action="store_true",
                         help="report what cleanup would remove, remove nothing")
     return parser.parse_args(argv)
@@ -75,6 +97,22 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
+    # Fill in whatever this machine has not exported -- tool locations, and
+    # whether there is a queue. Anything already exported is left alone.
+    try:
+        site.apply()
+    except site.SiteError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    # Asked once, here, before anything submits. RFD3 now goes through the same
+    # dispatcher stage 01 uses, so on a cluster this stage submits rather than
+    # running RFD3 on whichever node you happened to type the command on.
+    if site.mode() == "cluster":
+        try:
+            partitions.choose(args.partition)
+        except partitions.PartitionError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 2
     stage = args.stage.resolve()
     report = run_unpack(stage, args.experiment)
     _log(f"[unpack] {report.summary()}")
@@ -85,7 +123,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not args.no_generate:
         _log("")
         try:
-            run = run_rfd3(stage, args.experiment, args.designs)
+            run = run_rfd3(stage, args.experiment, args.designs,
+                           sequence_id=args.sequence_id,
+                           orientation=args.orientation,
+                           limit=args.limit)
         except Rfd3Error as exc:
             _log(f"[rfd3] {exc}")
             return 1

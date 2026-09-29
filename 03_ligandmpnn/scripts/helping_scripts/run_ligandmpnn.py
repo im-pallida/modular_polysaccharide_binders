@@ -38,6 +38,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "common"))
 import job_paths as jp  # noqa: E402
+import site_config as site  # noqa: E402
 from archives import merge_members_into_archive  # noqa: E402
 
 STAGE = Path(__file__).resolve().parents[2]
@@ -124,13 +125,54 @@ def read_specs(path: Path) -> Dict[str, dict]:
     return specs
 
 
+def interpreter() -> Path:
+    """The python that runs LigandMPNN's run.py.
+
+    Not necessarily this one. The pipeline's interpreter needs gemmi and numpy;
+    LigandMPNN needs torch. A single conda env can hold all three, which is why
+    sys.executable worked on the workstation -- but a cluster keeps them apart,
+    and there run.py has no torch to import.
+
+    LIGANDMPNN_PYTHON names it; site_config discovers it; and if neither found
+    anything, this interpreter is used, which is the old behaviour.
+    """
+    named = os.environ.get("LIGANDMPNN_PYTHON", "").strip()
+    return Path(named) if named else Path(sys.executable)
+
+
+def check_interpreter() -> None:
+    """Refuse before the queue, not after the allocation.
+
+    run.py fails with a bare ModuleNotFoundError several minutes into a job
+    that has already been scheduled. Asking the interpreter the same question
+    here costs a subprocess and turns that into a sentence.
+    """
+    python = interpreter()
+    try:
+        done = subprocess.run([str(python), "-c", "import torch"],
+                              capture_output=True, timeout=120)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise LigandMpnnError(f"cannot run {python}: {exc}")
+    if done.returncode != 0:
+        raise LigandMpnnError(
+            f"{python} cannot import torch, so LigandMPNN's run.py will not "
+            f"start.\n"
+            f"  Set LIGANDMPNN_PYTHON to an interpreter that can -- a venv of "
+            f"its own, beside the checkout:\n"
+            f"      LIGANDMPNN_PYTHON=<somewhere>/software/ligandmpnn_venv/bin/python\n"
+            f"  The pipeline interpreter needs gemmi and numpy; this one needs "
+            f"torch. They do not have to be the same python."
+        )
+    _log(f"[ligandmpnn] run.py will use {python}")
+
+
 def invoke(root: Path, checkpoint: Path, pdb_path: Path, spec: dict,
            out_folder: Path, num_seq: int) -> None:
     out_folder.mkdir(parents=True, exist_ok=True)
     groups = spec["symmetry_residues"]
     weights = "|".join(",".join(["0.5"] * len(group.split(","))) for group in groups)
     command = [
-        sys.executable, str(root / "run.py"),
+        str(interpreter()), str(root / "run.py"),
         "--model_type", "ligand_mpnn",
         "--checkpoint_ligand_mpnn", str(checkpoint),
         "--pdb_path", str(pdb_path),
@@ -222,6 +264,7 @@ def design_group(stage: Path, experiment: str, group_key: str, report: RunReport
                  num_seq: int = NUM_SEQ, preflight: bool = True) -> None:
     root = ligandmpnn_root()
     checkpoint = checkpoint_path(root)
+    check_interpreter()
     specs = read_specs(jp.redesign_spec_path(stage, experiment, group_key))
     if not specs:
         _log(f"[ligandmpnn] {experiment}/{group_key}: nothing prepared")
@@ -326,6 +369,14 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
+    # This file is what the sbatch script runs, not the launcher, so it fills in
+    # the machine's settings itself rather than relying on them having been
+    # exported at submission time.
+    try:
+        site.apply()
+    except site.SiteError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
     try:
         report = run_design(args.stage.resolve(), args.experiment,
                             args.num_seq, args.group_key)

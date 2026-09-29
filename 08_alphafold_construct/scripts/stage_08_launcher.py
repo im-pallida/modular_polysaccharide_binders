@@ -24,7 +24,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import shutil
 import sys
 from pathlib import Path
 from typing import List, Optional
@@ -37,7 +36,19 @@ COMMON_DIR = STAGE_ROOT.parent / "common"
 sys.path.insert(0, str(COMMON_DIR))
 sys.path.insert(0, str(HELPING_SCRIPTS_DIR))
 
+# Before importing anything that needs gemmi: if this interpreter cannot, start
+# again under one that can. A no-op wherever the environment is already right,
+# which is every workstation run.
+import bootstrap  # noqa: E402
+
+try:
+    bootstrap.ensure()
+except bootstrap.BootstrapError as _exc:
+    raise SystemExit(f"ERROR: {_exc}")
+
 import job_paths as jp  # noqa: E402
+import site_config as site  # noqa: E402
+import partitions  # noqa: E402
 from af3_prepare import PrepareError, run_prepare  # noqa: E402
 from run_af3 import Af3Error, run_af3  # noqa: E402
 from score_designs import run_scoring  # noqa: E402
@@ -116,11 +127,28 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                         help="keep outputs/, af3_runs/ and the input jsons")
     parser.add_argument("--clean-dry-run", action="store_true",
                         help="report what cleanup would remove, remove nothing")
+    parser.add_argument("--partition", default=None,
+                        help="submit to this Slurm partition instead of asking "
+                             "(cluster only; PIPELINE_PARTITION does the same)")
     return parser.parse_args(argv)
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
+    # Fill in whatever this machine has not exported -- tool locations, and
+    # whether there is a queue. Anything already exported is left alone.
+    try:
+        site.apply()
+    except site.SiteError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    # Asked once, here, before anything submits or any thread pool starts.
+    if site.mode() == "cluster":
+        try:
+            partitions.choose(args.partition)
+        except partitions.PartitionError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 2
     stage = args.stage.resolve()
 
     if not jp.inputs_root(stage).is_dir():
@@ -132,7 +160,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     folded_ok = True
     if not args.no_fold:
-        if shutil.which("sbatch") is None:
+        if site.mode() == "workstation":
             _log("[af3] no sbatch on PATH -- folding in place, one job at a time")
         folded_ok = fold_sequences(stage, args.experiment, args.max_concurrent)
 

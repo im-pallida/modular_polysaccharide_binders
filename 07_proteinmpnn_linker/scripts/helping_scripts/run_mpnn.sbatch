@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=ligandmpnn_stage03
+#SBATCH --job-name=mpnn_stage07
 #SBATCH --partition=gpu_h200
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4
@@ -35,11 +35,10 @@ if [ -z "$PYTHON" ] || ! "$PYTHON" -c 'import gemmi' 2>/dev/null; then
     echo "       Set RFD3_PIPELINE_PYTHON to an interpreter that can." >&2
     exit 1
 fi
-if [ -z "${LIGANDMPNN_ROOT:-}" ]; then
-    echo "ERROR: LIGANDMPNN_ROOT is not set; export it before submitting." >&2
-    echo "       It points at the LigandMPNN checkout, the folder holding run.py." >&2
+if [ -z "${MPNN_ROOT:-}" ]; then
+    echo "ERROR: MPNN_ROOT is not set; export it before submitting." >&2
     exit 1
 fi
 
-exec "$PYTHON" "$STAGE/scripts/helping_scripts/run_ligandmpnn.py" \
+exec "$PYTHON" "$STAGE/scripts/helping_scripts/run_mpnn.py" \
      "$EXPERIMENT" "$GROUP_KEY" --stage "$STAGE"

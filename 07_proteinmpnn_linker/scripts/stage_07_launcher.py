@@ -24,7 +24,6 @@ LigandMPNN: the linker binds nothing, so there is no ligand for the model to use
 from __future__ import annotations
 
 import argparse
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -38,7 +37,20 @@ COMMON_DIR = STAGE_ROOT.parent / "common"
 sys.path.insert(0, str(COMMON_DIR))
 sys.path.insert(0, str(HELPING_SCRIPTS_DIR))
 
+# Before importing anything that needs gemmi: if this interpreter cannot, start
+# again under one that can. A no-op wherever the environment is already right,
+# which is every workstation run.
+import bootstrap  # noqa: E402
+
+try:
+    bootstrap.ensure()
+except bootstrap.BootstrapError as _exc:
+    raise SystemExit(f"ERROR: {_exc}")
+
 import job_paths as jp  # noqa: E402
+import partitions  # noqa: E402
+import site_config as site  # noqa: E402
+from cleanup import run_cleanup  # noqa: E402
 from linker_prepare import PrepareError, prepare_group  # noqa: E402
 from run_mpnn import MpnnError, run_group  # noqa: E402
 from select_sequences import SelectionError, run_selection  # noqa: E402
@@ -66,15 +78,18 @@ def outstanding_groups(stage: Path, experiment: Optional[str]) -> List[Tuple[str
 
 def dispatch_group(stage: Path, experiment: str, group_key: str) -> bool:
     """Design one group: sbatch where it exists, in place otherwise."""
-    if shutil.which("sbatch") is not None:
+    if site.mode() == "cluster":
         logs = stage / "logs" / experiment
         logs.mkdir(parents=True, exist_ok=True)
         command = [
             "sbatch", "--wait",
+            *partitions.sbatch_args(),
             "--chdir", str(stage),
             "--output", str(logs / f"{group_key}-%j.out"),
             "--error", str(logs / f"{group_key}-%j.err"),
-            str(SBATCH_SCRIPT), experiment, group_key,
+            # The stage goes on the command line: a submitted batch script
+            # runs from SLURM's spool, not from the checkout.
+            str(SBATCH_SCRIPT), experiment, group_key, str(stage),
         ]
         _log("$ " + " ".join(command))
         return subprocess.run(command).returncode == 0
@@ -95,7 +110,7 @@ def design_structures(stage: Path, experiment: Optional[str]) -> bool:
         _log(f"[mpnn] nothing to design under {jp.inputs_root(stage)}")
         return True
 
-    mode = "cluster" if shutil.which("sbatch") else "workstation"
+    mode = site.mode()
     _log(f"[mpnn] {len(groups)} group(s), mode={mode}, one job per group")
     ok = True
     for experiment_name, group_key in groups:
@@ -144,6 +159,16 @@ def transfer_structures(stage: Path, experiment: Optional[str]) -> bool:
     return report.ok
 
 
+
+def tidy(stage: Path, experiment: Optional[str], dry_run: bool) -> bool:
+    """Clear what the archives already hold. Runs last, after the transfer, so
+    the archives the deletions are checked against are complete."""
+    report = run_cleanup(stage, experiment, dry_run)
+    _log(f"[clean] {report.summary()}")
+    for path in report.unarchived[:5]:
+        _log(f"[clean]   kept (not in any archive): {path}")
+    return True
+
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -157,11 +182,32 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                         help="skip ProteinMPNN; select from what is already designed")
     parser.add_argument("--no-transfer", action="store_true",
                         help="do not hand anything to stage 08")
+    parser.add_argument("--no-clean", action="store_true",
+                        help="keep the raw files even once they are archived")
+    parser.add_argument("--clean-dry-run", action="store_true",
+                        help="report what cleanup would remove, remove nothing")
+    parser.add_argument("--partition", default=None,
+                        help="submit to this Slurm partition instead of asking "
+                             "(cluster only; PIPELINE_PARTITION does the same)")
     return parser.parse_args(argv)
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
+    # Fill in whatever this machine has not exported -- tool locations, and
+    # whether there is a queue. Anything already exported is left alone.
+    try:
+        site.apply()
+    except site.SiteError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    # Asked once, here, before anything submits or any thread pool starts.
+    if site.mode() == "cluster":
+        try:
+            partitions.choose(args.partition)
+        except partitions.PartitionError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 2
     stage = args.stage.resolve()
 
     designed_ok = True
@@ -176,6 +222,9 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # Last, and only after the transfer: stage 08 has taken its copy by then, and
     # the archives the cleanup checks against are complete.
+    if not args.no_clean:
+        tidy(stage, args.experiment, args.clean_dry_run)
+
     return 0 if designed_ok and selected_ok and transferred_ok else 1
 
 

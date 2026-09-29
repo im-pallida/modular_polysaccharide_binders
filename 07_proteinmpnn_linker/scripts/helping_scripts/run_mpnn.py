@@ -59,6 +59,7 @@ import gemmi
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "common"))
 import job_paths as jp  # noqa: E402
+import site_config as site  # noqa: E402
 from archives import merge_members_into_archive  # noqa: E402
 from structures import classify_chains  # noqa: E402
 
@@ -106,6 +107,48 @@ def mpnn_root() -> Path:
     if missing:
         raise MpnnError(f"MPNN_ROOT={root} is missing {missing}")
     return root
+
+
+def interpreter() -> Path:
+    """The python that runs ProteinMPNN's scripts.
+
+    Not necessarily this one. The pipeline's interpreter needs gemmi, numpy and
+    biopython; protein_mpnn_run.py needs torch. A single conda env can hold all
+    of them, which is why sys.executable worked on the workstation -- but a
+    cluster keeps them apart, and there ProteinMPNN has no torch to import.
+
+    MPNN_PYTHON names it; site_config discovers it, and one of the places it
+    looks is the ligandmpnn venv, since both want torch. If neither found
+    anything, this interpreter is used, which is the old behaviour.
+    """
+    named = os.environ.get("MPNN_PYTHON", "").strip()
+    return Path(named) if named else Path(sys.executable)
+
+
+def check_interpreter() -> None:
+    """Refuse before the queue, not after the allocation.
+
+    protein_mpnn_run.py fails with a bare ModuleNotFoundError several minutes
+    into a job that has already been scheduled. Asking the interpreter the same
+    question here costs a subprocess and turns that into a sentence.
+    """
+    python = interpreter()
+    try:
+        done = subprocess.run([str(python), "-c", "import torch"],
+                              capture_output=True, timeout=120)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise MpnnError(f"cannot run {python}: {exc}")
+    if done.returncode != 0:
+        raise MpnnError(
+            f"{python} cannot import torch, so ProteinMPNN's protein_mpnn_run.py "
+            f"will not start.\n"
+            f"  Set MPNN_PYTHON to an interpreter that can -- the LigandMPNN venv "
+            f"already has torch and serves both:\n"
+            f"      MPNN_PYTHON=<somewhere>/software/ligandmpnn_venv/bin/python\n"
+            f"  The pipeline interpreter needs gemmi, numpy and biopython; this "
+            f"one needs torch. They do not have to be the same python."
+        )
+    _log(f"[mpnn] protein_mpnn_run.py will use {python}")
 
 
 def prepared_chains(prepared_dir: Path) -> List[str]:
@@ -158,9 +201,9 @@ def build_jsonls(root: Path, prepared_dir: Path, work_dir: Path,
     parsed = work_dir / "parsed.jsonl"
     assigned = work_dir / "assigned.jsonl"
 
-    _run([sys.executable, root / "helper_scripts" / "parse_multiple_chains.py",
+    _run([str(interpreter()), root / "helper_scripts" / "parse_multiple_chains.py",
           f"--input_path={prepared_dir}/", f"--output_path={parsed}"], "parse_multiple_chains")
-    _run([sys.executable, root / "helper_scripts" / "assign_fixed_chains.py",
+    _run([str(interpreter()), root / "helper_scripts" / "assign_fixed_chains.py",
           f"--input_path={parsed}", f"--output_path={assigned}",
           "--chain_list", " ".join(chains)], "assign_fixed_chains")
     return parsed, assigned
@@ -171,7 +214,7 @@ def invoke_mpnn(root: Path, parsed: Path, assigned: Path,
                 out_folder: Path, num_seq: int) -> None:
     out_folder.mkdir(parents=True, exist_ok=True)
     command = [
-        sys.executable, root / "protein_mpnn_run.py",
+        str(interpreter()), root / "protein_mpnn_run.py",
         "--jsonl_path", parsed,
         "--chain_id_jsonl", assigned,
         "--fixed_positions_jsonl", fixed_positions,
@@ -451,6 +494,7 @@ def split_and_archive(out_folder: Path, archive_path: Path) -> Tuple[int, int]:
 def run_group(stage: Path, experiment: str, group_key: str,
               num_seq: int = NUM_SEQ) -> RunResult:
     root = mpnn_root()
+    check_interpreter()
     prepared = jp.prepared_dir(stage, experiment, group_key)
     work_dir = jp.mpnn_work_dir(stage, experiment, group_key)
     fixed_positions = jp.fixed_positions_path(stage, experiment, group_key)
@@ -503,6 +547,14 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
+    # This file is what the sbatch script runs, not the launcher, so it fills in
+    # the machine's settings itself rather than relying on them having been
+    # exported at submission time.
+    try:
+        site.apply()
+    except site.SiteError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
     try:
         result = run_group(args.stage.resolve(), args.experiment, args.group_key, args.num_seq)
     except MpnnError as exc:

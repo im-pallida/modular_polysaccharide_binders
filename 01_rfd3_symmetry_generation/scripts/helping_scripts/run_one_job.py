@@ -43,6 +43,10 @@ from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 # helping_scripts/ -> scripts/ -> <stage>/ -> <repo root>/common
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "common"))
 import job_paths as jp  # noqa: E402
+# DispatchReport describes a dispatch, not a job, so it lives with the
+# dispatcher. Re-exported here because this is where it used to be.
+from rfd3_dispatch import DispatchReport  # noqa: E402,F401
+from archives import archived_stems  # noqa: E402
 from designs import (  # noqa: E402
     DesignError,
     fixed_residue_map,
@@ -92,24 +96,6 @@ class JobResult:
     raw_cif: Optional[Path] = None
     clean_archive: Optional[Path] = None
     message: str = ""
-
-
-@dataclass
-class DispatchReport:
-    """What a dispatcher did, so the launcher can archive and set an exit code
-    without each dispatcher reimplementing the reporting."""
-
-    rows: List[jp.RunRow] = field(default_factory=list)
-    failed: List[jp.RunRow] = field(default_factory=list)
-
-    @property
-    def ok(self) -> bool:
-        return not self.failed
-
-    def summary(self) -> str:
-        if self.ok:
-            return f"all {len(self.rows)} job(s) completed"
-        return f"{len(self.failed)} of {len(self.rows)} job(s) failed"
 
 
 @dataclass
@@ -238,6 +224,28 @@ def _prepare_rfd3_inputs(
         config = dict(config)
         rewritten[design] = config
 
+        # The input path is resolved for EVERY design, symmetric or not, and the
+        # resolved one written back.
+        #
+        # It used to be resolved only after the symmetry check below, so a json
+        # declaring no symmetry -- which is every stage 06 linker json -- went to
+        # RFD3 with its "input" exactly as stored. Stored by whichever machine
+        # wrote it: a path under /home/<user>/1cbh_clear is not there on a
+        # cluster, and RFD3's own failure for that is several hundred lines into
+        # a log naming a path that means nothing without knowing who wrote it.
+        #
+        # resolve_seed_path re-anchors such a path onto this checkout, so a json
+        # written on one machine runs on the other WITHOUT being regenerated --
+        # which matters because stage 06's linker lengths are set by hand.
+        raw_input = str(config.get("input", ""))
+        seed = jp.resolve_seed_path(stage, raw_input, json_path)
+        if seed is None:
+            raise JobError(f"{label}: input structure not found: {raw_input!r}")
+        if str(seed) != raw_input:
+            config["input"] = str(seed)
+            changed = True
+            _log(f"[input] {label}: {raw_input}\n        -> {seed}")
+
         symmetry = config.get("symmetry")
         if not isinstance(symmetry, dict) or not symmetry.get("id"):
             _log(f"[symmetry] {label} declares no symmetry.id")
@@ -245,10 +253,6 @@ def _prepare_rfd3_inputs(
         symmetry_id = str(symmetry["id"])
         env_name = _symmetry_translations_env_name(symmetry_id)
         order = _exact_order(symmetry_id)
-
-        seed = jp.resolve_seed_path(stage, str(config.get("input", "")), json_path)
-        if seed is None:
-            raise JobError(f"{label}: seed structure not found: {config.get('input')!r}")
 
         try:
             structure = load_structure(seed)
@@ -645,6 +649,15 @@ def run_one_job(
         _log(f"[skip] {name} -> {raw_cif} already exists")
         return JobResult(JobStatus.SKIPPED, name, raw_cif, clean_archive)
 
+    # The raw file is not the only evidence this was already generated. Once
+    # cleanup has cleared outputs_raw, the structure lives only in the group's
+    # archive -- and a resume that looked at the raw file alone would diffuse
+    # the whole experiment again, which is precisely what stage 06 did before
+    # its skip check was pointed at the archive instead.
+    if name in archived_stems(clean_archive, ".cif"):
+        _log(f"[skip] {name} -> already inside {clean_archive.name}")
+        return JobResult(JobStatus.SKIPPED, name, raw_cif, clean_archive)
+
     try:
         env = _resolve_rfd3_env(env_file)
 
@@ -691,10 +704,28 @@ def main(argv: Optional[List[str]] = None) -> int:
         "--stage", type=Path, default=STAGE,
         help=f"stage root directory (default: {STAGE})",
     )
+    # The sampler on the COMMAND LINE, not only in the function signature.
+    #
+    # run_one_job() has always taken sampler_overrides, so a stage that imports
+    # it could pass its own. This script could not, and the cluster route goes
+    # through this script -- so every submitted job ran stage 01's SYMMETRIC
+    # sampler whatever stage it belonged to. That is the whole reason stage 06
+    # had no cluster path: not a different architecture, one missing argument.
+    #
+    # Repeated --override REPLACES the defaults rather than adding to them. The
+    # caller that needs this is a stage whose defaults are wrong for it, and
+    # "symmetry settings plus your settings" is exactly what breaks a linker.
+    parser.add_argument(
+        "--override", action="append", default=None, metavar="KEY=VALUE",
+        help=f"an RFD3 sampler override, repeatable. Given at all, these "
+             f"REPLACE the stage 01 defaults ({', '.join(RFD3_SAMPLER_OVERRIDES)})",
+    )
     args = parser.parse_args(argv)
- 
+
+    overrides = tuple(args.override) if args.override else RFD3_SAMPLER_OVERRIDES
     result = run_one_job(
-        args.experiment, args.json_relative_path, args.global_seq, stage=args.stage
+        args.experiment, args.json_relative_path, args.global_seq,
+        stage=args.stage, sampler_overrides=overrides,
     )
     if result.status is JobStatus.FAILED:
         print(f"ERROR: {result.message}", file=sys.stderr)

@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import shutil
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -34,9 +33,22 @@ COMMON_DIR = STAGE_ROOT.parent / "common"
 sys.path.insert(0, str(COMMON_DIR))
 sys.path.insert(0, str(HELPING_SCRIPTS_DIR))
 
+# Before importing anything that needs gemmi: if this interpreter cannot, start
+# again under one that can. A no-op wherever the environment is already right,
+# which is every workstation run.
+import bootstrap  # noqa: E402
+
+try:
+    bootstrap.ensure()
+except bootstrap.BootstrapError as _exc:
+    raise SystemExit(f"ERROR: {_exc}")
+
 import job_paths as jp  # noqa: E402
+import site_config as site  # noqa: E402
+import partitions  # noqa: E402
 import run_cluster  # noqa: E402
 import run_workstation  # noqa: E402
+from cleanup import run_cleanup  # noqa: E402
 from designs import fixed_residues  # noqa: E402
 from filter_designs import Stage01InputError, run_filter  # noqa: E402
 from run_one_job import archive_experiment, exclusive_lock  # noqa: E402
@@ -234,6 +246,96 @@ def check_seeds(seed_structures: Dict[str, Path]) -> None:
 # Step 2. Input search
 
 
+def available_experiments(stage: Path) -> List[Tuple[str, int]]:
+    """(name, how many jsons) for every experiment folder that has any.
+
+    A folder with no jsons is not an experiment you can run, so it is not
+    offered -- being shown a choice that then fails is worse than not being
+    shown it.
+    """
+    root = jp.json_root(stage)
+    if not root.is_dir():
+        return []
+    found: List[Tuple[str, int]] = []
+    for directory in sorted(path for path in root.iterdir() if path.is_dir()):
+        count = len(list(directory.glob("*.json")))
+        if count:
+            found.append((directory.name, count))
+    return found
+
+
+def ask_experiment(choices: Sequence[Tuple[str, int]]) -> str:
+    """Show what there is and read a name, or a number from the list."""
+    _log("")
+    _log("[experiment] which experiment do you want to generate from?")
+    _log("")
+    for index, (name, count) in enumerate(choices, start=1):
+        _log(f"  {index})  {name:<40} {count} json file(s)")
+    _log("")
+    names = {name for name, _ in choices}
+    default = choices[0][0] if len(choices) == 1 else ""
+    for _ in range(3):
+        try:
+            answer = input(f"experiment{f' [{default}]' if default else ''}: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            _log("")
+            raise SystemExit("ERROR: no experiment chosen")
+        if not answer and default:
+            return default
+        if answer in names:
+            return answer
+        if answer.isdecimal() and 1 <= int(answer) <= len(choices):
+            return choices[int(answer) - 1][0]
+        _log(f"  '{answer}' is not one of: {', '.join(sorted(names))}")
+    raise SystemExit("ERROR: no experiment chosen")
+
+
+def resolve_experiment(stage: Path, requested: Optional[str],
+                      interactive: Optional[bool] = None) -> str:
+    """The experiment to run: the one asked for, or the one chosen from a list.
+
+    Running with no experiment used to be an argparse error -- "the following
+    arguments are required" -- which tells someone who has just cloned this
+    what the syntax is, and nothing about what they could actually run. The
+    answer is sitting in json/, so it is read and offered.
+
+    An empty json/ is the one case that still fails, because there is nothing
+    to choose from and nothing to do.
+    """
+    choices = available_experiments(stage)
+    if not choices:
+        raise SystemExit(
+            f"ERROR: there are no experiments to run.\n"
+            f"  Add design jsons to start generation:\n"
+            f"      {jp.json_root(stage)}/<experiment>/<name>.json\n"
+            f"  Each json names a seed structure and a contig; one folder under\n"
+            f"  json/ is one experiment."
+        )
+
+    names = {name for name, _ in choices}
+    if requested:
+        if requested in names:
+            return requested
+        listed = ", ".join(sorted(names))
+        raise SystemExit(
+            f"ERROR: no experiment called {requested!r} under {jp.json_root(stage)}.\n"
+            f"  There is: {listed}"
+        )
+
+    if len(choices) == 1:
+        only, count = choices[0]
+        _log(f"[experiment] {only} is the only one with jsons ({count} file(s)), using it")
+        return only
+    can_ask = sys.stdin.isatty() if interactive is None else interactive
+    if not can_ask:
+        listed = ", ".join(name for name, _ in choices)
+        raise SystemExit(
+            f"ERROR: {len(choices)} experiments to choose from and nothing "
+            f"attached to ask.\n  Name one: {listed}"
+        )
+    return ask_experiment(choices)
+
+
 def experiment_dir_for(stage: Path, experiment: str) -> Path:
     """Experiment folder search."""
     experiment_dir = jp.experiment_json_dir(stage, experiment)
@@ -351,7 +453,7 @@ def build_run_list(stage: Path, experiment: str, counts: Dict[str, int]) -> Tupl
 
 def dispatch(experiment: str, run_list: Path, stage: Path):
     """Cluster if sbatch is available, workstation otherwise."""
-    if shutil.which("sbatch") is not None:
+    if site.mode() == "cluster":
         return run_cluster.dispatch_cluster(experiment, run_list, stage)
     return run_workstation.dispatch_workstation(experiment, run_list, stage)
 
@@ -409,11 +511,22 @@ def transfer_structures(stage: Path) -> bool:
     return report.ok
 
 
+
+def tidy(stage: Path, experiment: Optional[str], dry_run: bool) -> bool:
+    """Clear what the archives already hold. Runs last, after the transfer, so
+    the archives the deletions are checked against are complete."""
+    report = run_cleanup(stage, experiment, dry_run)
+    _log(f"[clean] {report.summary()}")
+    for path in report.unarchived[:5]:
+        _log(f"[clean]   kept (not in any archive): {path}")
+    return True
+
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("experiment", help="folder name under json/")
+    parser.add_argument("experiment", nargs="?", default=None,
+                        help="folder name under json/; omit to choose from a list")
     parser.add_argument(
         "--stage", type=Path, default=STAGE_ROOT,
         help=f"stage root directory (default: {STAGE_ROOT})",
@@ -435,6 +548,13 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--counts", default=None,
         help="per-json counts, e.g. 'small.json=25,large.json=10' (non-interactive)",
     )
+    parser.add_argument("--no-clean", action="store_true",
+                        help="keep the raw files even once they are archived")
+    parser.add_argument("--clean-dry-run", action="store_true",
+                        help="report what cleanup would remove, remove nothing")
+    parser.add_argument("--partition", default=None,
+                        help="submit to this Slurm partition instead of asking "
+                             "(cluster only; PIPELINE_PARTITION does the same)")
     args = parser.parse_args(argv)
     if args.count is not None and args.count < 0:
         parser.error("--count must be non-negative")
@@ -443,7 +563,27 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
+    # Fill in whatever this machine has not exported -- tool locations, and
+    # whether there is a queue. Anything already exported is left alone.
+    try:
+        site.apply()
+    except site.SiteError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
     stage = args.stage.resolve()
+
+    # What to run comes before where to run it: being asked to pick a partition
+    # before knowing which experiment is about to go onto it is backwards, and
+    # an empty json/ should fail before anyone is asked anything at all.
+    args.experiment = resolve_experiment(stage, args.experiment)
+
+    # Asked once, here, before anything submits or any thread pool starts.
+    if site.mode() == "cluster":
+        try:
+            partitions.choose(args.partition)
+        except partitions.PartitionError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 2
 
     experiment_dir = experiment_dir_for(stage, args.experiment)
     json_names = discover_jsons(experiment_dir)
@@ -466,10 +606,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not args.no_transfer:
         transferred_ok = transfer_structures(stage)
 
+    # Last, and only after the transfer: outputs_raw is cleared on the strength
+    # of the archives, so those archives have to be complete first.
+    if not args.no_clean:
+        tidy(stage, args.experiment, args.clean_dry_run)
+
     _log(f"[done] {report.summary()}")
     return 0 if report.ok and filtered_ok and transferred_ok else 1
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

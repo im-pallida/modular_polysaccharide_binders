@@ -47,14 +47,46 @@ module purge
 module load alphafold/3.0.1
 module list
 
-AF3_WORKDIR="${AF3_WORKDIR:-/scratch/SCWF00146/karina/software/alphafold}"
+# Sourced after `module load`, so the module's own values are already in the
+# environment and win: site.env only fills what is still empty.
+# From $STAGE, which was passed in -- NOT from BASH_SOURCE, which in a
+# submitted job points into SLURM's spool directory. The note at the top of
+# this file says so; this line used to ignore it.
+_COMMON="$(cd "$STAGE/.." && pwd)/common"
+if [ -f "$_COMMON/site.env" ]; then . "$_COMMON/site.env"; fi
+: "${AF3_WORKDIR:?AF3_WORKDIR not set -- run python3 \"$_COMMON/check_site.py\"}"
 AF3_MODEL_PARAMETERS_DIR="${AF3_MODEL_PARAMETERS_DIR:-$AF3_WORKDIR/model_parameters}"
-# No defaults for these three: `module load alphafold/3.0.1` is expected to set
+# No defaults for these two: `module load alphafold/3.0.1` is expected to set
 # them, and failing loudly beats apptainer binding an empty path and AF3 then
 # failing deep inside the container with a confusing error.
-: "${AF3_PUB_DB_DIR:?AF3_PUB_DB_DIR not set -- expected from 'module load alphafold/3.0.1'}"
 : "${AF3_IMAGE_DIR:?AF3_IMAGE_DIR not set -- expected from 'module load alphafold/3.0.1'}"
 : "${AF3_IMAGE:?AF3_IMAGE not set -- expected from 'module load alphafold/3.0.1'}"
+
+# Whether to search for MSAs, decided by DB_DIR -- the same switch the
+# workstation runner has always had, and the one check_site reports as "unset
+# means --norun_data_pipeline". This branch was missing here, so that sentence
+# was true on one machine and not the other: the cluster asked AF3 for the full
+# data pipeline on every job.
+#
+# Skipping it is the correct default. The jsons declare empty unpairedMsa and
+# pairedMsa with no templates -- AF3's documented way of saying "fold this
+# alone" -- because these are de novo designs with no homologs to find.
+#
+# On the cluster the databases themselves come from the module, so DB_DIR only
+# has to be set to something; AF3_PUB_DB_DIR is used when DB_DIR is not itself
+# a directory, which is the case in site.local.env, where $AF3_PUB_DB_DIR is
+# not expandable because the module has not been loaded yet.
+DB_DIR="${DB_DIR:-}"
+if [ -n "$DB_DIR" ]; then
+    [ -d "$DB_DIR" ] || DB_DIR="${AF3_PUB_DB_DIR:?DB_DIR is set but names no directory, and AF3_PUB_DB_DIR is unset -- expected from 'module load alphafold/3.0.1'}"
+    PIPELINE_ARGS=(--db_dir=/root/public_databases)
+    DB_BIND=(--bind "$DB_DIR:/root/public_databases")
+    echo "pipeline = full MSA search ($DB_DIR)"
+else
+    PIPELINE_ARGS=(--norun_data_pipeline)
+    DB_BIND=()
+    echo "pipeline = skipped (--norun_data_pipeline); set DB_DIR to run it"
+fi
 
 # Where AF3 actually put its output.
 #
@@ -94,13 +126,13 @@ apptainer exec \
     --bind "$AF3_INPUT:/root/af_input" \
     --bind "$AF3_OUTPUT:/root/af_output" \
     --bind "$AF3_MODEL_PARAMETERS_DIR:/root/models" \
-    --bind "$AF3_PUB_DB_DIR:/root/public_databases" \
+    ${DB_BIND[@]+"${DB_BIND[@]}"} \
     "$AF3_IMAGE_DIR/$AF3_IMAGE" \
         python /app/alphafold/run_alphafold.py \
         --json_path=/root/af_input/fold_input.json \
         --model_dir=/root/models \
-        --db_dir=/root/public_databases \
-        --output_dir=/root/af_output
+        --output_dir=/root/af_output \
+        "${PIPELINE_ARGS[@]}"
 PRODUCED_DIR="$(find_produced "$AF3_OUTPUT" "$JOB_NAME" || true)"
 fi
 

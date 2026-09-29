@@ -242,19 +242,25 @@ def write_pair(stage: Path, experiment: str, group_key: str, sequence_id: str,
         if not chain_residues:
             raise LinkerError(f"chain {name} has no amino acid residues")
 
-    # ABSOLUTE, the way stage 01's jsons name their seed, and pointing into
-    # stage 06 where RFD3 will read it.
+    # RELATIVE TO THE CHECKOUT ROOT, pointing into stage 06 where RFD3 reads it:
     #
-    # It was relative, on the reasoning that both stages spell the path the same
-    # way and RFD3 runs with cwd pinned to the stage root. That reasoning has a
-    # hole: run_one_job only rewrites "input" for a design that declares a
-    # symmetry block, and a linker json deliberately declares none -- the linker
-    # runs between two termini and no symmetry operation maps that onto itself.
-    # So the path reaches RFD3 exactly as written, and anything that resolves it
-    # against a different directory cannot find the file.
+    #     06_rfd3_linker_generation/inputs_prepared/<experiment>/<group>/<sid>.pdb
+    #
+    # It was absolute for a real reason: run_one_job rewrote "input" only for a
+    # design declaring a symmetry block, and a linker json deliberately declares
+    # none, so the path reached RFD3 exactly as written and had to be one RFD3
+    # could open. The cost was that the json only worked on the machine that
+    # wrote it -- /home/<user>/1cbh_clear on the workstation is not a path the
+    # cluster has, and these jsons carry hand-set linker lengths, so the only
+    # remedy was to throw that work away and regenerate them.
+    #
+    # run_one_job now resolves "input" for EVERY design and writes the absolute
+    # path back before RFD3 sees it, so the json can hold the portable spelling
+    # and still reach RFD3 with a path it can open. Jsons already written with an
+    # absolute path keep working: resolve_seed_path re-anchors them.
     target = (jp.pair_dir(jp.stage06_root(stage), experiment, group_key)
               / f"{sequence_id}.pdb")
-    relative = str(target.resolve())
+    relative = str(target.resolve().relative_to(stage.parent.resolve()))
 
     json_dir = jp.linker_json_dir(jp.stage06_root(stage), experiment)
     json_dir.mkdir(parents=True, exist_ok=True)
