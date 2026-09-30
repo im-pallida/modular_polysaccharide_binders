@@ -1,0 +1,29 @@
+{
+  "2cwr_2xseed_1xchitin_dp13": {
+    "input": "/home/karina/1cbh_clear/00_reference_structures/seed/2cwr_2xseed_1xchitin_dp13.pdb",
+    "contig": "17-30,B17-24,28-34,B51-54,16-24,B71-71,17-20",
+    "length": "91-121",
+    "select_fixed_atoms": {
+      "B17": "ALL",
+      "B18": "ALL",
+      "B19": "ALL",
+      "B20": "ALL",
+      "B21": "ALL",
+      "B22": "ALL",
+      "B23": "ALL",
+      "B24": "ALL",
+      "B51": "ALL",
+      "B52": "ALL",
+      "B53": "ALL",
+      "B54": "ALL",
+      "B71": "ALL"
+    },
+    "select_exposed": "B19,B53,B71",
+    "is_non_loopy": true,
+    "plddt_enhanced": true,
+    "symmetry": {
+      "id": "T2EXACT",
+      "is_symmetric_motif": true
+    }
+  }
+}
