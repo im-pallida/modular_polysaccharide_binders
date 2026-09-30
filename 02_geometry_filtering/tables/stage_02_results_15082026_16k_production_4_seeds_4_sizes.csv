@@ -1,9 +1,0 @@
-protein_id,experiment_name,time_stamp,seed,ligand_chains,protein_ligand_clash_cutoff,protein_protein_clash_cutoff,protein_protein_contacts_cutoff,rmsd_after_kabsch,protein_ligand_clashes,protein_protein_clashes,clashing_residues,protein_protein_contacts,status,rejection_reason,skip_reason
-hsx015864,15082026_16k_production_4_seeds_4_sizes,2026-09-20T22:32:13+00:00,1cbh_2xseed_1xcellulose_dp20.pdb,M,0,0,7,0.391376,0,0,,8,PASSED,,
-hsx015165,15082026_16k_production_4_seeds_4_sizes,2026-09-20T22:32:13+00:00,1cbh_2xseed_1xcellulose_dp20.pdb,M,0,0,7,0.376723,0,0,,9,PASSED,,
-hsx015069,15082026_16k_production_4_seeds_4_sizes,2026-09-20T22:32:13+00:00,1cbh_2xseed_1xcellulose_dp20.pdb,M,0,0,7,0.354824,0,0,,13,PASSED,,
-hsx015406,15082026_16k_production_4_seeds_4_sizes,2026-09-20T22:32:13+00:00,1cbh_2xseed_1xcellulose_dp20.pdb,M,0,0,7,0.372587,0,0,,24,PASSED,,
-hsx015313,15082026_16k_production_4_seeds_4_sizes,2026-09-20T22:32:13+00:00,1cbh_2xseed_1xcellulose_dp20.pdb,M,0,0,7,0.396473,0,0,,26,PASSED,,
-hsx015754,15082026_16k_production_4_seeds_4_sizes,2026-09-20T22:32:13+00:00,1cbh_2xseed_1xcellulose_dp20.pdb,M,0,0,7,0.37932,0,0,,41,PASSED,,
-hsx015960,15082026_16k_production_4_seeds_4_sizes,2026-09-20T22:32:13+00:00,1cbh_2xseed_1xcellulose_dp20.pdb,M,0,0,7,0.364347,1,1,"[(98, 34)]",75,REJECTED,more_than_0_protein_protein_clashes;protein_ligand_clashes,
-hsx015039,15082026_16k_production_4_seeds_4_sizes,2026-09-20T22:32:13+00:00,1cbh_2xseed_1xcellulose_dp20.pdb,M,0,0,7,0.351678,0,0,,122,PASSED,,
