@@ -60,6 +60,20 @@ OVERRIDE = ("RFD3_PIPELINE_PYTHON", "PIPELINE_PYTHON")
 # Anchored to the checkout first, for the same reason AF3_WORKDIR is: on a
 # cluster the account running the job is often not the account the directory is
 # named for, so $USER finds nothing while $PROJECT/.. finds everything.
+#
+# The conda entries come last, after every purpose-built venv: a venv made for
+# this pipeline is a deliberate answer, and a conda env that happens to carry
+# gemmi is a lucky one. They are here because on a workstation the interpreter
+# that can run the pipeline IS a conda env -- so without them the only way to
+# start from a shell with the wrong env active was to have exported
+# RFD3_PIPELINE_PYTHON beforehand, which is exactly the "remember to set
+# something first" this file exists to remove.
+#
+# $CONDA_PREFIX/envs/* matters as much as $CONDA_PREFIX/bin: in a base
+# environment CONDA_PREFIX is the conda ROOT, and the env holding gemmi is one
+# level down. Globbing cannot pick a wrong one -- usable() proves every
+# candidate by running `import gemmi, numpy` in it -- but it does cost one
+# subprocess per env, so it is reached only when no venv and no override exist.
 CANDIDATES = (
     "$PROJECT/../software/pipeline_venv/bin/python",
     "$PROJECT/../software/pipeline_venv/bin/python3",
@@ -68,6 +82,11 @@ CANDIDATES = (
     "$HOME/software/pipeline_venv/bin/python",
     "/shared/scratch/*/*/software/pipeline_venv/bin/python",
     "/scratch/*/*/software/pipeline_venv/bin/python",
+    "$CONDA_PREFIX/bin/python",
+    "$CONDA_PREFIX/envs/*/bin/python",
+    "$HOME/*conda*/envs/*/bin/python",
+    "$HOME/*mamba*/envs/*/bin/python",
+    "$HOME/*forge*/envs/*/bin/python",
 )
 
 
@@ -125,6 +144,49 @@ def find_interpreter(packages: Sequence[str] = REQUIRED) -> Optional[str]:
     return None
 
 
+def environment_root(python: str) -> Optional[str]:
+    """The conda env or venv an interpreter belongs to, or None.
+
+    Both put the interpreter at <root>/bin/python and both are what the rest of
+    the pipeline means by $CONDA_PREFIX, so both are recognised -- by a marker
+    inside the directory rather than by the path looking right.
+    """
+    path = Path(python).resolve()
+    if path.parent.name != "bin":
+        return None
+    root = path.parent.parent
+    if (root / "conda-meta").is_dir() or (root / "pyvenv.cfg").is_file():
+        return str(root)
+    return None
+
+
+def adopt_environment(environment: dict, python: str) -> dict:
+    """Make the environment describe the interpreter that will run in it.
+
+    THE HALF RE-EXEC. ensure() used to change the interpreter and nothing else,
+    so a launcher started from a shell with (base) activated re-executed into
+    the foundry env while CONDA_PREFIX still said base. Everything that asks the
+    environment where its tools are then answers for the wrong one:
+
+        rfd3.env          falls back to "$CONDA_PREFIX/bin/rfd3"
+        site_config       lists $CONDA_PREFIX/bin/rfd3 as its first candidate
+
+    and the run dies with "RFD3_EXE and/or CKPT not set" while `conda activate
+    foundry` followed by the identical command works. That is precisely the
+    "it works if you remember to activate something first" this file exists to
+    remove.
+
+    PATH is deliberately left alone: putting an env's bin in front of it inside
+    a process that goes on to call sbatch, squeue and module risks shadowing
+    them, and CONDA_PREFIX is what the two lookups above actually read.
+    """
+    root = environment_root(python)
+    if root is None or environment.get("CONDA_PREFIX", "") == root:
+        return environment
+    environment["CONDA_PREFIX"] = root
+    return environment
+
+
 def ensure(packages: Sequence[str] = REQUIRED) -> None:
     """Return under a usable interpreter, or re-exec into one, or explain.
 
@@ -141,6 +203,9 @@ def ensure(packages: Sequence[str] = REQUIRED) -> None:
         # re-exec exported the name) and starting it under the right one did
         # not. setdefault, so an explicit export still wins.
         os.environ.setdefault("RFD3_PIPELINE_PYTHON", sys.executable)
+        # Also when no re-exec was needed: an interpreter run by full path from
+        # an unactivated shell has the same mismatch.
+        adopt_environment(os.environ, sys.executable)
         return
 
     missing = ", ".join(packages)
@@ -172,6 +237,13 @@ def ensure(packages: Sequence[str] = REQUIRED) -> None:
     # Pass the interpreter on so the submitted jobs use the same one; their
     # sbatch scripts already read this name.
     environment.setdefault("RFD3_PIPELINE_PYTHON", python)
+    # And move the ENVIRONMENT with it, not just the interpreter.
+    adopt_environment(environment, python)
+    if environment.get("CONDA_PREFIX") != os.environ.get("CONDA_PREFIX"):
+        print(f"[bootstrap] CONDA_PREFIX -> {environment['CONDA_PREFIX']} "
+              f"(it described {os.environ.get('CONDA_PREFIX') or '<unset>'}, "
+              f"which is not where that interpreter lives)",
+              file=sys.stderr, flush=True)
     script = os.path.abspath(sys.argv[0])
     os.execve(python, [python, script] + sys.argv[1:], environment)
 

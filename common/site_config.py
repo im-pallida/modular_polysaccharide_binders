@@ -180,11 +180,32 @@ SETTINGS: Tuple[Setting, ...] = (
     # answer is the same whoever asks and wherever they ask from.
     Setting(
         "RFD3_EXE", "the rfd3 executable", "file",
+        # $CONDA_PREFIX/bin/rfd3 first: an environment somebody activated on
+        # purpose is an answer, not a guess.
+        #
+        # $CONDA_PREFIX/envs/*/bin/rfd3 second, and it is the one that stops
+        # this being a trick question. In a base environment CONDA_PREFIX is the
+        # conda ROOT, so the envs live one level down and rfd3 is a sibling of
+        # the interpreter that could not find it. Without this line the only
+        # thing that could resolve an rfd3 installed inside a conda env was
+        # having that exact env activated -- so `conda deactivate` broke stage
+        # 01, and bootstrap's re-exec had to carry CONDA_PREFIX across for the
+        # run to survive at all. It still does, but nothing now DEPENDS on it.
+        #
+        # The $HOME/*conda*, *mamba*, *forge* globs cover the case with nothing
+        # activated at all: conda is not on PATH, CONDA_PREFIX is unset, and the
+        # env is still sitting where the installer put it. Named by shape rather
+        # than by product so miniconda3, anaconda3, miniforge3, mambaforge and
+        # micromamba all land, without five near-identical lines.
         ("$CONDA_PREFIX/bin/rfd3",
+         "$CONDA_PREFIX/envs/*/bin/rfd3",
          "$PROJECT/../software/rfd3/envs/*/bin/rfd3",
          "$PROJECT/../software/*/bin/rfd3",
          "$HOME/software/rfd3/envs/*/bin/rfd3",
-         "$HOME/.foundry/bin/rfd3"),
+         "$HOME/.foundry/bin/rfd3",
+         "$HOME/*conda*/envs/*/bin/rfd3",
+         "$HOME/*mamba*/envs/*/bin/rfd3",
+         "$HOME/*forge*/envs/*/bin/rfd3"),
         stages=("01", "06"),
     ),
     Setting(

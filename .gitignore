@@ -72,3 +72,4 @@ results/
 # than the generated output that **/json/ is meant to catch.
 !06_rfd3_linker_generation/json/
 !06_rfd3_linker_generation/json/**
+common/site.local.env
