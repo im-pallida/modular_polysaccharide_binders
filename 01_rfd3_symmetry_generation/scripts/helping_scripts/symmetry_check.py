@@ -392,6 +392,68 @@ def missing_residues(source: StructureLike, config: dict) -> List[Tuple[str, int
     )
 
 
+def copy_transforms(
+    source: StructureLike,
+    asu_chain: str,
+    tolerance: float = DEFAULT_TOLERANCE,
+) -> List[Tuple[np.ndarray, Tuple[float, float, float]]]:
+    """(rotation, translation) mapping `asu_chain` onto every protein copy.
+
+        copy = R @ asu + t
+
+    which is the convention the overlay's frames already use, so what is
+    measured here can be handed over unchanged.
+
+    The ASU itself comes first as (identity, zero), and the rest are ordered by
+    distance along the motion, so the result maps directly onto
+    RFD3_T<N>EXACT_TRANSLATIONS.
+
+    A ROTATION IS NOT REFUSED. copy_translations() below is this function with
+    the rotation required to be identity, which was the only thing the frames
+    could carry until they learned to carry a full rigid motion. A chitin seed
+    whose two copies are related by a 45 degree screw has a perfectly good
+    operator; it simply is not a translation.
+
+    What is still refused is a copy that is not RIGID -- a different
+    conformation, not a different placement -- because no single frame can
+    express that however it is written.
+    """
+    structure = load_structure(source)
+    chains = {c.name: c for c in protein_chains(structure)}
+    if asu_chain not in chains:
+        raise StructureError(
+            f"ASU chain {asu_chain!r} not among the protein chains {sorted(chains)}"
+        )
+
+    reference, _ = chain_atoms(chains[asu_chain])
+    reference_coords = _coordinates(reference)
+
+    found: List[Tuple[float, np.ndarray, Tuple[float, float, float]]] = []
+    for name, chain in chains.items():
+        if name == asu_chain:
+            continue
+        records, _ = chain_atoms(chain)
+        mismatch = _composition_mismatch(reference, records, asu_chain, name)
+        if mismatch:
+            raise StructureError(f"copy {name} does not match the ASU: {mismatch}")
+
+        coords = _coordinates(records)
+        rotation, translation = _best_fit(reference_coords, coords, allow_reflection=False)
+        deviation = float(_deviations(reference_coords, coords, rotation, translation).max())
+        if deviation > tolerance:
+            raise StructureError(
+                f"chain {name} is not a rigid copy of {asu_chain} "
+                f"(worst atom off by {deviation:.4f} A, tol={tolerance} A)"
+            )
+        transform = _describe_transform(rotation, translation, reference_coords, coords)
+        found.append((transform.centroid_shift_a, rotation,
+                      tuple(float(v) for v in translation)))
+
+    found.sort(key=lambda item: item[0])
+    return ([(np.eye(3), (0.0, 0.0, 0.0))]
+            + [(rotation, translation) for _, rotation, translation in found])
+
+
 def copy_translations(
     source: StructureLike,
     asu_chain: str,

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -87,6 +88,138 @@ def _missing_keys(data: dict, required_keys: Sequence[str], label: str) -> str:
     return f"{label} missing required field(s): {missing}" if missing else ""
 
 
+RANGE = re.compile(r"^(\d+)(?:-(\d+))?$")
+MOTIF = re.compile(r"^([A-Za-z])(\d+)-(\d+)$")
+
+# Every symmetry id the overlay routes, and what each one takes. Kept here
+# because an id it does not route dies as "Symmetry id X not supported" from
+# inside RFD3, after the GPU, naming neither the alternatives nor the fact that
+# this pipeline only ever measures frames into the T<N>EXACT form.
+SYMMETRY_IDS = (
+    (re.compile(r"^T(\d+)EXACT$"),
+     "exact frames measured off the seed -- what this pipeline writes, and the "
+     "only form that receives them"),
+    (re.compile(r"^T(\d+)$"),
+     "evenly spaced along one axis, from RFD3_T3_RISE and RFD3_T3_AXIS"),
+    (re.compile(r"^SCREW(\d+)$"),
+     "evenly spaced and rotated, from RFD3_SCREW_RISE/ANGLE_DEG/AXIS -- the "
+     "axis must be x, y or z, so a seed's own screw axis will not fit it"),
+    (re.compile(r"^C(\d+)$"), "stock RFD3 cyclic"),
+    (re.compile(r"^D(\d+)$"), "stock RFD3 dihedral"),
+)
+
+
+def symmetry_id_problem(symmetry_id) -> str:
+    """Why the overlay would not route this id, or "".
+
+    Note SCREW<N> is listed and still not what a measured screw wants: it turns
+    about x, y or z only. A seed whose copies are related by 45 degrees about
+    (0.428, -0.601, -0.675) is expressed as a T<N>EXACT frame carrying the
+    matrix, which is why "SCREW" is not simply accepted here with an order
+    appended.
+    """
+    if not isinstance(symmetry_id, str) or not symmetry_id.strip():
+        return f"'symmetry.id' must be a non-empty string, got {symmetry_id!r}"
+    text = symmetry_id.strip().upper()
+    if text == "INPUT_DEFINED":
+        return ("'symmetry.id' is input_defined, which the overlay routes but "
+                "has never implemented (get_frames_from_file raises)")
+    for pattern, _ in SYMMETRY_IDS:
+        if pattern.match(text):
+            return ""
+    known = "\n".join(f"      {pattern.pattern.strip('^$'):<14} {what}"
+                      for pattern, what in SYMMETRY_IDS)
+    extra = ""
+    if text.startswith(("SCREW", "T")) and not any(c.isdigit() for c in text):
+        extra = (f"\n    {text} has no order. A measured screw does not need "
+                 f"SCREW at all: keep T<N>EXACT, which now carries a full "
+                 f"rotation as twelve numbers.")
+    return (f"'symmetry.id' is {symmetry_id!r}, which the overlay does not "
+            f"route -- RFD3 stops with \"Symmetry id {symmetry_id} not "
+            f"supported\". It routes:\n{known}{extra}")
+
+
+def contig_extent(contig: str) -> Tuple[int, int, str]:
+    """(shortest, longest, how it adds up) for a contig string.
+
+    A contig is segments separated by commas, each either a DIFFUSED length --
+    "27-40", or a bare "18" -- or a FIXED motif range taken from the seed, like
+    "B26-26". The total is the fixed residues, which are a constant, plus the
+    diffused ranges summed.
+    """
+    diffused_low = diffused_high = fixed = 0
+    parts: List[str] = []
+    for raw in contig.split(","):
+        segment = raw.strip()
+        if not segment:
+            continue
+        motif = MOTIF.match(segment)
+        if motif:
+            _, start, end = motif.groups()
+            count = int(end) - int(start) + 1
+            if count < 1:
+                raise ValueError(f"segment {segment!r} spans {count} residue(s)")
+            fixed += count
+            parts.append(f"{segment}={count}")
+            continue
+        span = RANGE.match(segment)
+        if span is None:
+            raise ValueError(
+                f"segment {segment!r} is neither a diffused length (27-40) nor a "
+                f"motif range (B26-26)"
+            )
+        low = int(span.group(1))
+        high = int(span.group(2)) if span.group(2) else low
+        if high < low:
+            raise ValueError(f"segment {segment!r} counts down")
+        diffused_low += low
+        diffused_high += high
+        parts.append(segment)
+    return (fixed + diffused_low, fixed + diffused_high,
+            f"fixed {fixed} + diffused {diffused_low}-{diffused_high}")
+
+
+def length_problem(contig: str, length) -> str:
+    """Why RFD3 would refuse this contig and length together, or "".
+
+    RFD3 works out the same two numbers and, when they cannot both be satisfied,
+    stops with
+
+        ComponentValidationError: No valid selections possible with the given
+        constraints.
+
+    several hundred lines into a traceback and after the GPU has been allocated,
+    naming neither the contig nor the length. The arithmetic is three lines, so
+    it belongs here, before anything is queued -- and it can say what the length
+    should have been.
+    """
+    if length is None:
+        return ""
+    try:
+        low, high, how = contig_extent(str(contig))
+    except ValueError as exc:
+        return f"'contig' cannot be read: {exc}"
+
+    text = str(length).strip()
+    span = RANGE.match(text)
+    if span is None:
+        return (f"'length' is {length!r}, which is not a number or a range; "
+                f"the contig allows {low}-{high} ({how})")
+    want_low = int(span.group(1))
+    want_high = int(span.group(2)) if span.group(2) else want_low
+
+    if want_high < low or want_low > high:
+        return (f"'length' {text} and 'contig' cannot both hold: the contig "
+                f"builds {low}-{high} residues ({how}), which does not overlap "
+                f"{want_low}-{want_high}. RFD3 refuses this with \"No valid "
+                f"selections possible with the given constraints\". Set "
+                f"'length': \"{low}-{high}\"")
+    if want_low < low or want_high > high:
+        return (f"'length' {text} reaches outside what 'contig' can build, "
+                f"{low}-{high} ({how}). Set 'length': \"{low}-{high}\"")
+    return ""
+
+
 def validate_json_file(json_path: Path, stage: Path) -> JsonValidationResult:
     """Checks the file parses, has the fields RFD3 needs and that the seed
     structure its "input" field points at actually exists."""
@@ -123,6 +256,14 @@ def validate_json_file(json_path: Path, stage: Path) -> JsonValidationResult:
         problem = _missing_keys(symmetry, REQUIRED_SYMMETRY_KEYS, f"{where} 'symmetry'")
         if problem:
             return JsonValidationResult(False, problem)
+
+        problem = symmetry_id_problem(symmetry.get("id"))
+        if problem:
+            return JsonValidationResult(False, f"{where}: {problem}")
+
+        problem = length_problem(config["contig"], config.get("length"))
+        if problem:
+            return JsonValidationResult(False, f"{where}: {problem}")
 
         raw_input = config["input"]
         if not isinstance(raw_input, str) or not raw_input:
@@ -220,9 +361,15 @@ def check_seed(seed_structure: Path) -> None:
         # RFD3_<symmetry.id>_TRANSLATIONS, so show it before anything is queued.
         _log(f"     translations: {format_translation_spec(result.transform.displacement)}")
     elif result.transform is not None:
-        _log("[note] the two chains are related by a rotation, not a pure translation, "
-             "so the translation operator cannot be derived from this seed -- set "
-             "RFD3_<symmetry.id>_TRANSLATIONS explicitly if that is intended.")
+        # A screw is an operator like any other -- it just cannot be written as
+        # three numbers. Each job measures the full rotation and translation off
+        # the seed and hands them over as a twelve-number frame, so this reports
+        # what will happen rather than warning that nothing can.
+        _log(f"     screw operator: {result.transform.rotation_deg:.2f} deg about "
+             f"({', '.join(f'{v:.3f}' for v in result.transform.axis)}), "
+             f"rise {result.transform.screw_rise_a:.3f} A")
+        _log("     carried to RFD3 as a full rotation+translation frame "
+             "(12 numbers), not as a displacement")
     if result.altlocs_collapsed:
         _log(f"[note] collapsed {result.altlocs_collapsed} alternate conformer(s) "
              f"(highest occupancy kept)")

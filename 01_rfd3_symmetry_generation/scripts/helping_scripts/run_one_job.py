@@ -177,6 +177,44 @@ def _resolve_rfd3_env(env_file: Path) -> Rfd3Env:
     return Rfd3Env(rfd3_exe, ckpt, environment)
 
 
+def _frame_spec(transforms) -> str:
+    """Measured frames in RFD3_<ID>_TRANSLATIONS form.
+
+    Two spellings, and which one is used is decided by the seed rather than by
+    a setting:
+
+        x,y,z                       a pure translation -- identity rotation
+        r11,...,r33,x,y,z           a full rigid motion, rotation row-major
+
+    The short form is what every cellulose seed produces and what the variable
+    has always held, so nothing that worked stops working and a spec stays
+    readable when there is nothing to read but a displacement. The long form is
+    what a screw needs: a chitin seed whose copies are related by 45 degrees
+    about (0.428, -0.601, -0.675) has no axis-aligned spelling at all, so the
+    matrix is written out rather than reduced to an axis and an angle.
+    """
+    import numpy as np
+
+    def number(value: float, places: int) -> str:
+        # Rounded BEFORE formatting, then nudged off negative zero: a Kabsch fit
+        # of a pure translation returns components like -1e-16, and "-0.0000" in
+        # a spec reads as a direction rather than as nothing.
+        return f"{round(float(value), places) + 0.0:.{places}f}"
+
+    parts: List[str] = []
+    for rotation, translation in transforms:
+        vector = ",".join(number(c, 4) for c in translation)
+        if np.allclose(rotation, np.eye(3), atol=1e-6):
+            parts.append(vector)
+        else:
+            # Nine decimals, not six: the reader checks R @ R.T against the
+            # identity to 1e-6, and a matrix rounded to six decimals misses
+            # that by about the tolerance itself. The cost is a longer line.
+            parts.append(",".join(number(v, 9) for v in np.asarray(rotation).ravel())
+                         + "," + vector)
+    return ";".join(parts)
+
+
 def _symmetry_translations_env_name(symmetry_id: str) -> str:
     """The overlay builds this name at runtime from the json's symmetry id --
     'T2EXACT' -> 'RFD3_T2EXACT_TRANSLATIONS' -- so it is derived here the same
@@ -204,7 +242,7 @@ def _prepare_rfd3_inputs(
     try:
         from symmetry_check import (
             StructureError,
-            copy_translations,
+            copy_transforms,
             load_structure,
             protein_chains,
             referenced_residues,
@@ -265,7 +303,25 @@ def _prepare_rfd3_inputs(
             continue
 
         # Several copies present: derive the frames and hand RFD3 one protomer.
-        if order is not None and len(chains) != order:
+        #
+        # Only T<N>EXACT receives them. _symmetry_translations_env_name builds
+        # RFD3_<ID>_TRANSLATIONS from whatever the id is, and the overlay reads
+        # RFD3_T<N>EXACT_TRANSLATIONS and nothing else -- so a json saying SCREW
+        # had its frames measured correctly and exported to a name no code reads,
+        # then died on the id. Measuring into a variable nobody reads is worse
+        # than refusing, because the export looks like it worked.
+        if order is None:
+            raise JobError(
+                f"{label}: {seed.name} holds {len(chains)} protein chains, so the "
+                f"frames are measured from it -- but 'symmetry.id' is "
+                f"{symmetry_id!r} and only T<N>EXACT receives measured frames. "
+                f"The overlay reads RFD3_T<N>EXACT_TRANSLATIONS; this run would "
+                f"have exported {env_name}, which nothing reads.\n"
+                f"  Set 'symmetry.id': \"T{len(chains)}EXACT\". It carries a "
+                f"screw as well as a translation -- a rotation is written out as "
+                f"twelve numbers rather than needing SCREW."
+            )
+        if len(chains) != order:
             raise JobError(
                 f"{label}: {seed.name} holds {len(chains)} protein chains "
                 f"({', '.join(chains)}) but {symmetry_id} declares {order} frames"
@@ -285,13 +341,11 @@ def _prepare_rfd3_inputs(
             )
 
         try:
-            offsets = copy_translations(structure, asu_chain)
+            transforms = copy_transforms(structure, asu_chain)
         except StructureError as exc:
             raise JobError(f"{label}: cannot derive frames from {seed.name}: {exc}")
 
-        spec = ";".join(
-            "0,0,0" if not any(v) else ",".join(f"{c:.4f}" for c in v) for v in offsets
-        )
+        spec = _frame_spec(transforms)
         asu_path = work_dir / f"asu_{design or 'design'}_{asu_chain}.pdb"
         write_asu(structure, asu_chain, asu_path)
 

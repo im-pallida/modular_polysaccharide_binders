@@ -75,7 +75,20 @@ def get_symmetry_frames_from_symmetry_id(symmetry_id):
         ), "symmetry_file is required for input_defined symmetry"
         frames = get_frames_from_file(sym_conf.symmetry_file)
     else:
-        raise ValueError(f"Symmetry id {symmetry_id} not supported")
+        raise ValueError(
+            f"Symmetry id {symmetry_id} not supported. This overlay routes:\n"
+            f"  T<N>EXACT  exact frames from RFD3_T<N>EXACT_TRANSLATIONS; each\n"
+            f"             frame is x,y,z or r11..r33,x,y,z, so a screw about\n"
+            f"             ANY axis fits here\n"
+            f"  T<N>       even spacing, RFD3_T3_RISE / RFD3_T3_AXIS\n"
+            f"  SCREW<N>   even spacing plus rotation, RFD3_SCREW_RISE /\n"
+            f"             RFD3_SCREW_ANGLE_DEG / RFD3_SCREW_AXIS -- axis must\n"
+            f"             be x, y or z\n"
+            f"  C<N>, D<N> stock RFD3 cyclic and dihedral\n"
+            f"Note the order is part of the id: 'SCREW' alone does not route, "
+            f"'SCREW2' does. A screw measured off a seed belongs in T<N>EXACT, "
+            f"not SCREW<N>, because SCREW<N> cannot express an arbitrary axis."
+        )
 
     for R, _ in frames:
         assert is_valid_rotation_matrix(R), f"Frame {R} is not a valid rotation matrix"
@@ -150,6 +163,21 @@ def _exact_translational_frames(order):
     authoritatively determines how many translations are required,
     fixing the earlier inconsistency where T3EXACT's name implied 3
     frames but a patch had silently loosened it to "at least 2".
+
+    T3_LINEAR_OVERLAY — each frame may now be EITHER
+
+        x,y,z                  three numbers: a translation, identity rotation
+        r11,...,r33,x,y,z      twelve numbers: a full rigid motion, rotation
+                               row-major, applied as  copy = R @ unit + t
+
+    The twelve-number form exists because SCREW<N> can only turn about x, y or
+    z, and a real seed's screw axis is wherever the crystal put it: a chitin
+    pair related by 45 deg about (0.428, -0.601, -0.675) has no axis-aligned
+    spelling. Measuring the operator off the seed and writing the matrix out
+    avoids having to name an axis at all.
+
+    Three numbers stays the default spelling for a pure translation, so every
+    existing RFD3_T<N>EXACT_TRANSLATIONS keeps working untouched.
     """
     import os
     env_name = f"RFD3_T{order}EXACT_TRANSLATIONS"
@@ -163,9 +191,41 @@ def _exact_translational_frames(order):
         if not item:
             continue
         vals = [float(x) for x in item.split(",")]
-        if len(vals) != 3:
-            raise ValueError(f"Bad translation {item!r} in {env_name}; expected x,y,z")
-        frames.append((np.eye(3, dtype=np.float32), np.array(vals, dtype=np.float32)))
+        if len(vals) == 3:
+            R = np.eye(3, dtype=np.float32)
+            T = np.array(vals, dtype=np.float32)
+        elif len(vals) == 12:
+            R = np.array(vals[:9], dtype=np.float32).reshape(3, 3)
+            T = np.array(vals[9:], dtype=np.float32)
+            if not is_valid_rotation_matrix(np.asarray(R, dtype=float)):
+                raise ValueError(
+                    f"Bad frame {item!r} in {env_name}: the first nine numbers are "
+                    f"not a rotation matrix (R @ R.T is not the identity). They are "
+                    f"read row-major, r11,r12,r13,r21,..."
+                )
+            # TRANSPOSED HERE, AT THE BOUNDARY.
+            #
+            # The spec is written the way the operator is measured off the seed
+            # and the way anyone would write it down:  copy = R @ asu + t.
+            # RFD3 applies a frame in the ROW-vector convention, coords @ R + t,
+            # so handing it R unchanged applies R-transpose -- which for a
+            # rotation is its inverse.
+            #
+            # Measured on a real chitin pair: the produced copy-to-copy rotation
+            # came out 89.93 deg away from the emitted operator and 0.14 deg away
+            # from its transpose, and reapplying coords @ R + t reproduced the
+            # produced chain to 0.058 A against 18.0 A for R @ coords + t.
+            #
+            # Pure translations were immune, the identity being its own
+            # transpose, which is why every translational seed worked and this
+            # only surfaced on the first seed with a rotation in its operator.
+            R = R.T.copy()
+        else:
+            raise ValueError(
+                f"Bad frame {item!r} in {env_name}: expected 3 numbers (x,y,z) or "
+                f"12 (r11..r33,x,y,z), got {len(vals)}"
+            )
+        frames.append((R, T))
 
     if len(frames) != order:
         raise ValueError(
