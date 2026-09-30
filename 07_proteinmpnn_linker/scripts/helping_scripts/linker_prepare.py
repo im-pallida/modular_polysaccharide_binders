@@ -84,6 +84,20 @@ def _log(*parts: object) -> None:
     print(*parts, flush=True)
 
 
+def why_failed(failed: Dict[str, str], limit: int = 5) -> str:
+    """The reasons, for an exception message that would otherwise be a count.
+
+    This stage logs each failure as it happens, so the reason is already on
+    screen -- but the launcher reports only the raised message, and that one
+    line should stand on its own in a job log somebody reads a day later.
+    """
+    items = sorted(failed.items())
+    shown = "; ".join(f"{name}: {reason}" for name, reason in items[:limit])
+    if len(items) > limit:
+        shown += f" (+{len(items) - limit} more)"
+    return shown or "no reason recorded"
+
+
 @dataclass
 class PrepareResult:
     experiment: str
@@ -483,7 +497,7 @@ def prepare_group(stage: Path, experiment: str, group_key: str,
     if not fixed:
         raise PrepareError(
             f"{experiment}/{group_key}: nothing could be prepared "
-            f"({len(result.failed)} construct(s) failed)"
+            f"({len(result.failed)} construct(s) failed) -- {why_failed(result.failed)}"
         )
 
     result.fixed_positions.write_text(json.dumps(fixed) + "\n", encoding="utf-8")

@@ -75,6 +75,21 @@ def _log(*parts: object) -> None:
     print(*parts, flush=True)
 
 
+def why_failed(failed: Dict[str, str], limit: int = 5) -> str:
+    """The reasons, for an exception message that would otherwise be a count.
+
+    "1 structure(s) failed" sends somebody reading source to find out what
+    happened; the reason was already in hand when that message was built.
+    Capped, because a group of 500 that all failed for the same reason should
+    not print 500 times to say so.
+    """
+    items = sorted(failed.items())
+    shown = "; ".join(f"{name}: {reason}" for name, reason in items[:limit])
+    if len(items) > limit:
+        shown += f" (+{len(items) - limit} more)"
+    return shown or "no reason recorded"
+
+
 @dataclass
 class PrepareResult:
     experiment: str
@@ -244,6 +259,11 @@ def prepare_group(stage: Path, experiment: str, group_key: str) -> PrepareResult
             except (PrepareError, DesignError, StructureError, OSError, RuntimeError,
                     ValueError, KeyError, json.JSONDecodeError) as exc:
                 result.failed[protein_id] = str(exc).splitlines()[0]
+                # Said here as well as collected, because report() -- the only
+                # thing that printed these -- never runs when the group has no
+                # successes: the raise below returns first. A group that fails
+                # entirely is exactly when you need the reason.
+                _log(f"[prepare] {protein_id}: FAILED ({exc})")
             finally:
                 structure_path.unlink(missing_ok=True)
                 json_path.unlink(missing_ok=True)
@@ -255,7 +275,7 @@ def prepare_group(stage: Path, experiment: str, group_key: str) -> PrepareResult
     if not fresh:
         raise PrepareError(
             f"{experiment}/{group_key}: nothing could be prepared "
-            f"({len(result.failed)} structure(s) failed)"
+            f"({len(result.failed)} structure(s) failed) -- {why_failed(result.failed)}"
         )
 
     # Appended, not rewritten: a later run over new structures in the same group
